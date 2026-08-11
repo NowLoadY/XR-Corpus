@@ -419,6 +419,10 @@ impl PromptContextManager {
                     .join(" "),
             );
         let current_evidence = fold_for_match(&hints.join(" "));
+        // New activation must be justified by the current turn (plus live
+        // runtime facts), never by combining unrelated words from separate
+        // history entries. Confirmed active state is retained separately.
+        let mut activation_evidence = current_evidence.clone();
         let snapshot = self.catalog.snapshot()?;
         // Runtime `Always` corpora (for example the current VRCX room) are
         // prompt data and activation evidence for regular static corpora.
@@ -432,6 +436,10 @@ impl PromptContextManager {
                     evidence.push_str(&fold_for_match(value));
                     evidence.push(' ');
                     evidence.push_str(&fold_for_match(&split_identifier_words(value)));
+                    activation_evidence.push(' ');
+                    activation_evidence.push_str(&fold_for_match(value));
+                    activation_evidence.push(' ');
+                    activation_evidence.push_str(&fold_for_match(&split_identifier_words(value)));
                 }
             }
         }
@@ -477,17 +485,46 @@ impl PromptContextManager {
                     })
                     .cloned()
                     .collect::<Vec<_>>();
+                let current_matched_triggers = corpus
+                    .triggers
+                    .iter()
+                    .chain(corpus.trigger_aliases.iter())
+                    .filter(|term| {
+                        languages
+                            .iter()
+                            .filter_map(|language| term.value(language))
+                            .map(fold_for_match)
+                            .any(|keyword| evidence_contains_term(&activation_evidence, &keyword))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let current_activation_context = corpus
+                    .activation_context
+                    .iter()
+                    .filter(|term| {
+                        languages
+                            .iter()
+                            .filter_map(|language| term.value(language))
+                            .map(fold_for_match)
+                            .any(|keyword| evidence_contains_term(&activation_evidence, &keyword))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let activation_context_satisfied =
-                    corpus.activation_context.is_empty() || !matched_activation_context.is_empty();
+                    corpus.activation_context.is_empty() || !current_activation_context.is_empty();
+                let newly_eligible =
+                    !current_matched_triggers.is_empty() && activation_context_satisfied;
+                let unconstrained_history_eligible =
+                    corpus.activation_context.is_empty() && !matched_triggers.is_empty();
                 let eligible = corpus.activation == CorpusActivation::Always
-                    || (!matched_triggers.is_empty() && activation_context_satisfied);
+                    || newly_eligible
+                    || unconstrained_history_eligible
+                    || self.active_corpus_ids.contains(&corpus.id);
                 let current_triggers = if corpus.activation == CorpusActivation::OnEvidence
-                    && eligible
+                    && newly_eligible
                 {
-                    corpus
-                        .triggers
+                    current_matched_triggers
                         .iter()
-                        .chain(corpus.trigger_aliases.iter())
                         .chain(corpus.activation_context.iter())
                         .filter(|term| {
                             languages
@@ -506,7 +543,10 @@ impl PromptContextManager {
                 } else {
                     current_triggers.clone()
                 };
-                let score = matched_triggers.len() + matched_activation_context.len();
+                let score = current_matched_triggers.len()
+                    + current_activation_context.len()
+                    + matched_triggers.len()
+                    + matched_activation_context.len();
                 eligible.then_some((
                     corpus.priority,
                     score,
@@ -1679,6 +1719,28 @@ mod tests {
                 .unwrap()
                 .contains("大阪烧,okonomiyaki")
         );
+    }
+
+    #[test]
+    fn country_and_topic_from_different_turns_do_not_form_a_new_activation() {
+        let mut cuisine = corpus(
+            "geography-and-culture.japan.cuisine",
+            50,
+            CorpusActivation::OnEvidence,
+            &[("Japan", "Japan")],
+            &[("okonomiyaki", "okonomiyaki")],
+        );
+        cuisine.activation_context = vec![bilingual_term("food", "food")];
+        let catalog = CorpusCatalog::from_definitions(vec![cuisine]).unwrap();
+        let mut context = PromptContextManager::new(config(), catalog).unwrap();
+
+        context.record_transcript("The food was good yesterday");
+        let country_only = context
+            .select("auto", "zh,en", &["Japan"], (1_000, 1_000))
+            .unwrap();
+
+        assert!(country_only.translation_prompt().is_none());
+        assert!(country_only.activation_matches("Japan").is_empty());
     }
 
     #[test]

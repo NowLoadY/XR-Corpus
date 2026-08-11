@@ -78,6 +78,11 @@ impl CorpusClient {
                 "XR Corpus URL must be an absolute http:// or https:// URL".into(),
             ));
         }
+        if !parsed.host_str().is_some_and(is_loopback_host) {
+            return Err(CorpusClientError::InvalidUrl(
+                "XR Corpus currently accepts loopback URLs only".into(),
+            ));
+        }
         if parsed.query().is_some() || parsed.fragment().is_some() || parsed.path() != "/" {
             return Err(CorpusClientError::InvalidUrl(
                 "XR Corpus base URL cannot contain a path, query, or fragment".into(),
@@ -85,6 +90,9 @@ impl CorpusClient {
         }
         let base_url = parsed.as_str().trim_end_matches('/').to_owned();
         let http = reqwest::Client::builder()
+            // XR Corpus is a process-local service. System and environment
+            // proxies must never intercept its health or session requests.
+            .no_proxy()
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(8))
             .build()
@@ -262,20 +270,56 @@ async fn decode<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> 
 
 async fn response_error(response: reqwest::Response) -> CorpusClientError {
     let status = response.status();
-    match response.json::<ErrorResponse>().await {
-        Ok(body) => CorpusClientError::Server {
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(error) => {
+            return CorpusClientError::InvalidResponse(format!(
+                "XR Corpus returned {status}, but its response body could not be read: {error}"
+            ));
+        }
+    };
+    match serde_json::from_str::<ErrorResponse>(&body) {
+        Ok(error) => CorpusClientError::Server {
             status: status.as_u16(),
-            code: body.code,
-            message: body.error,
+            code: error.code,
+            message: error.error,
         },
-        Err(error) => CorpusClientError::InvalidResponse(format!(
-            "XR Corpus returned {status} with an invalid error body: {error}"
-        )),
+        Err(_) => CorpusClientError::Server {
+            status: status.as_u16(),
+            code: "non_json_response".into(),
+            message: response_body_summary(&body),
+        },
     }
 }
 
 fn request_error(error: reqwest::Error) -> CorpusClientError {
     CorpusClientError::Transport(format!("XR Corpus request failed: {error}"))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn response_body_summary(body: &str) -> String {
+    const MAX_CHARS: usize = 512;
+    let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return "the service returned an empty non-JSON response".into();
+    }
+    let mut characters = normalized.chars();
+    let summary = characters.by_ref().take(MAX_CHARS).collect::<String>();
+    if characters.next().is_some() {
+        format!("{summary}...")
+    } else {
+        summary
+    }
 }
 
 fn provider_path(provider_id: &str) -> CorpusResult<String> {
@@ -299,11 +343,16 @@ mod tests {
     #[test]
     fn base_url_is_validated_before_any_network_request() {
         assert!(CorpusClient::new("http://127.0.0.1:7766").is_ok());
-        assert!(CorpusClient::new("https://corpus.example").is_ok());
+        assert!(CorpusClient::new("http://[::1]:7766").is_ok());
+        assert!(CorpusClient::new("https://corpus.example").is_err());
         assert!(CorpusClient::new("ws://127.0.0.1:7766").is_err());
         assert!(CorpusClient::new("http://127.0.0.1:7766/v1").is_err());
         assert!(CorpusClient::new("not a url").is_err());
         assert!(provider_path("my-game").is_ok());
         assert!(provider_path("../other").is_err());
+        assert_eq!(
+            response_body_summary("  upstream\n unavailable  "),
+            "upstream unavailable"
+        );
     }
 }

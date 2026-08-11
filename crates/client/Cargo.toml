@@ -9,6 +9,7 @@ description = "Async Rust client for the XR Corpus local service."
 [dependencies]
 reqwest = { version = "0.13.4", features = ["json"] }
 serde = "1.0.229"
+serde_json = "1.0.151"
 xr-corpus-protocol = { path = "../protocol" }
 
 [dev-dependencies]
