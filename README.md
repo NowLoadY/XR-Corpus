@@ -20,6 +20,17 @@ cargo run -p xr-corpus-server -- --config config.example.json
 
 The server listens on `127.0.0.1:7766` by default. `GET /healthz` reports readiness.
 
+Start integrations with the typed Rust client:
+
+```rust
+let corpus = xr_corpus_client::CorpusClient::connect("http://127.0.0.1:7766").await?;
+let session = corpus.create_session().await?;
+```
+
+`connect` verifies API compatibility before returning. See [API.md](API.md) for the complete
+session lifecycle, dynamic-provider contract, error format, and curl examples. A compilable runtime
+provider is included at [`crates/client/examples/publish_runtime.rs`](crates/client/examples/publish_runtime.rs).
+
 ## Corpus format
 
 See [`corpora/v1/SCHEMA.md`](corpora/v1/SCHEMA.md). Each terminology row uses the fixed language

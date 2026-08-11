@@ -1,12 +1,15 @@
 [package]
 name = "xr-corpus-client"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://github.com/NowLoadY/XR-Corpus"
 description = "Async Rust client for the XR Corpus local service."
 
 [dependencies]
 reqwest = { version = "0.13.4", features = ["json"] }
 serde = "1.0.229"
 xr-corpus-protocol = { path = "../protocol" }
+
+[dev-dependencies]
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }

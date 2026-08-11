@@ -221,9 +221,11 @@ impl CorpusDefinition {
             MAX_TRIGGERS,
         )?;
         validate_terms(&self.id, "terms", &self.terms, MAX_TERMS)?;
-        if self.triggers.is_empty() || self.terms.is_empty() {
+        if self.terms.is_empty()
+            || (self.activation == CorpusActivation::OnEvidence && self.triggers.is_empty())
+        {
             return Err(format!(
-                "corpus {} must contain at least one trigger and one term",
+                "corpus {} must contain at least one term, and evidence-activated corpora need at least one trigger",
                 self.id
             ));
         }
@@ -896,6 +898,29 @@ mod tests {
             .replace_snapshot("vrchat-api", Vec::new(), Some(Duration::ZERO))
             .unwrap();
         assert!(source.snapshot().unwrap().is_empty());
+    }
+
+    #[test]
+    fn always_active_runtime_corpus_does_not_require_fake_triggers() {
+        let source = DynamicCorpusSource::default();
+        let corpus = CorpusDefinition {
+            schema: CORPUS_SCHEMA.into(),
+            id: "runtime.example.room".into(),
+            domain: "virtual-worlds".into(),
+            subdomain: "example".into(),
+            title: "Current room".into(),
+            priority: 100,
+            activation: CorpusActivation::Always,
+            triggers: Vec::new(),
+            trigger_aliases: Vec::new(),
+            activation_context: Vec::new(),
+            terms: vec![term(&[("en", "Player One")])],
+        };
+
+        source
+            .replace_snapshot("example", vec![corpus.clone()], None)
+            .unwrap();
+        assert_eq!(source.snapshot().unwrap(), [corpus]);
     }
 
     #[test]

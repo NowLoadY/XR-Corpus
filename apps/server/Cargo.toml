@@ -1,9 +1,9 @@
 [package]
 name = "xr-corpus-server"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://github.com/NowLoadY/XR-Corpus"
 description = "Local session and terminology service for XR Corpus."
 
 [dependencies]

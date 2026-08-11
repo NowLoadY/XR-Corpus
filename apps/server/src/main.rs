@@ -18,17 +18,17 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    routing::{delete, get, post},
+    routing::{get, post, put},
 };
 use clap::Parser;
 use serde::Deserialize;
 use tracing::{info, warn};
-use xr_corpus_core::{CorpusCatalog, CorpusConfig};
+use xr_corpus_core::{CorpusCatalog, CorpusConfig, DynamicCorpusSource};
 use xr_corpus_protocol::{
     API_VERSION, ContextBudgets, CreateSessionRequest, CreateSessionResponse, ErrorResponse,
     HealthResponse, PrepareAsrRequest, PrepareAsrResponse, PrepareTranslationRequest,
-    PrepareTranslationResponse, RecordTranslationRequest, RecordTranslationResponse,
-    SegmentContext,
+    PrepareTranslationResponse, ProviderSnapshotResponse, PublishProviderRequest,
+    RecordTranslationRequest, RecordTranslationResponse, SegmentContext, SessionStateResponse,
 };
 use xr_corpus_session::{PromptContextManager, PromptContextSnapshot};
 
@@ -49,12 +49,12 @@ struct Arguments {
 
 #[derive(Clone)]
 struct AppState {
-    sessions: Arc<Mutex<HashMap<String, CorpusSession>>>,
+    sessions: Arc<Mutex<HashMap<String, Arc<Mutex<CorpusSession>>>>>,
     catalog: CorpusCatalog,
     config: CorpusConfig,
     next_session_id: Arc<AtomicU64>,
     session_ttl: Duration,
-    corpus_count: usize,
+    dynamic_source: DynamicCorpusSource,
     vrcx: vrcx::VrcxRuntimeSource,
 }
 
@@ -88,6 +88,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_target(false)
         .init();
     let args = Arguments::parse();
+    if !args.listen.ip().is_loopback() {
+        return Err("XR Corpus currently accepts loopback listen addresses only".into());
+    }
     let config: ServiceConfig = serde_json::from_str(&std::fs::read_to_string(&args.config)?)?;
     PromptContextManager::validate(&config.prompt_context)?;
     let project_root = args
@@ -98,9 +101,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| PathBuf::from("."));
     let catalog = CorpusCatalog::load(&config.prompt_context, &project_root)?;
     let corpus_count = catalog.snapshot()?.len();
+    let dynamic_source = catalog.dynamic_source();
     let vrcx = vrcx::VrcxRuntimeSource::new(
         config.integrations.vrcx.clone(),
-        catalog.dynamic_source(),
+        dynamic_source.clone(),
         &project_root,
     )?;
     let _vrcx_monitor = vrcx.start();
@@ -110,15 +114,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: config.prompt_context,
         next_session_id: Arc::new(AtomicU64::new(1)),
         session_ttl: Duration::from_secs(args.session_idle_seconds.max(30)),
-        corpus_count,
+        dynamic_source,
         vrcx,
     };
     spawn_session_reaper(state.clone());
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/v1/integrations/vrcx/status", get(vrcx::get_status))
+        .route(
+            "/v1/providers/{provider_id}",
+            put(publish_provider).delete(delete_provider),
+        )
         .route("/v1/sessions", post(create_session))
-        .route("/v1/sessions/{session_id}", delete(delete_session))
+        .route(
+            "/v1/sessions/{session_id}",
+            get(session_state).delete(delete_session),
+        )
         .route("/v1/sessions/{session_id}/asr", post(prepare_asr))
         .route(
             "/v1/sessions/{session_id}/translation",
@@ -137,14 +148,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+async fn health(State(state): State<AppState>) -> ApiResult<HealthResponse> {
     let session_count = state.sessions.lock().map(|value| value.len()).unwrap_or(0);
-    Json(HealthResponse {
+    let corpus_count = state.catalog.snapshot().map_err(internal_error)?.len();
+    Ok(Json(HealthResponse {
         status: "ok".into(),
         api_version: API_VERSION,
-        corpus_count: state.corpus_count,
+        server_version: env!("CARGO_PKG_VERSION").into(),
+        corpus_count,
         session_count,
-    })
+    }))
 }
 
 async fn create_session(
@@ -157,12 +170,12 @@ async fn create_session(
         .map_err(internal_error)?;
     state.sessions.lock().map_err(lock_error)?.insert(
         session_id.clone(),
-        CorpusSession {
+        Arc::new(Mutex::new(CorpusSession {
             manager,
             snapshots: HashMap::new(),
             next_context_id: 1,
             last_used: Instant::now(),
-        },
+        })),
     );
     Ok(Json(CreateSessionResponse { session_id }))
 }
@@ -183,15 +196,64 @@ async fn delete_session(
     }
 }
 
+async fn session_state(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> ApiResult<SessionStateResponse> {
+    let session = find_session(&state, &session_id)?;
+    let session = session.lock().map_err(lock_error)?;
+    Ok(Json(SessionStateResponse {
+        session_id,
+        active_corpus_ids: session.manager.active_corpus_ids(),
+        snapshot_count: session.snapshots.len(),
+    }))
+}
+
+async fn publish_provider(
+    State(state): State<AppState>,
+    Path(provider_id): Path<String>,
+    Json(request): Json<PublishProviderRequest>,
+) -> ApiResult<ProviderSnapshotResponse> {
+    if !(5..=3_600).contains(&request.ttl_seconds) {
+        return Err(bad_request(
+            "provider_ttl_out_of_range",
+            "ttl_seconds must be between 5 and 3600",
+        ));
+    }
+    let corpus_count = request.corpora.len();
+    state
+        .dynamic_source
+        .replace_snapshot(
+            &provider_id,
+            request.corpora,
+            Some(Duration::from_secs(request.ttl_seconds)),
+        )
+        .map_err(|message| bad_request("invalid_provider_snapshot", message))?;
+    Ok(Json(ProviderSnapshotResponse {
+        provider_id,
+        corpus_count,
+        ttl_seconds: request.ttl_seconds,
+    }))
+}
+
+async fn delete_provider(
+    State(state): State<AppState>,
+    Path(provider_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .dynamic_source
+        .remove_provider(&provider_id)
+        .map_err(internal_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn prepare_asr(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     Json(request): Json<PrepareAsrRequest>,
 ) -> ApiResult<PrepareAsrResponse> {
-    let mut sessions = state.sessions.lock().map_err(lock_error)?;
-    let session = sessions
-        .get_mut(&session_id)
-        .ok_or_else(session_not_found)?;
+    let session = find_session(&state, &session_id)?;
+    let mut session = session.lock().map_err(lock_error)?;
     session.last_used = Instant::now();
     let snapshot = session
         .manager
@@ -202,7 +264,7 @@ async fn prepare_asr(
             budgets(request.budgets),
         )
         .map_err(internal_error)?;
-    let context_id = insert_snapshot(session, snapshot.clone());
+    let context_id = insert_snapshot(&mut session, snapshot.clone());
     Ok(Json(PrepareAsrResponse {
         context_id,
         prompt: snapshot.asr_prompt(),
@@ -215,16 +277,14 @@ async fn prepare_translation(
     Path(session_id): Path<String>,
     Json(request): Json<PrepareTranslationRequest>,
 ) -> ApiResult<PrepareTranslationResponse> {
-    let mut sessions = state.sessions.lock().map_err(lock_error)?;
-    let session = sessions
-        .get_mut(&session_id)
-        .ok_or_else(session_not_found)?;
+    let session = find_session(&state, &session_id)?;
+    let mut session = session.lock().map_err(lock_error)?;
     session.last_used = Instant::now();
     let asr_snapshot = session
         .snapshots
         .get(&request.asr_context_id)
         .cloned()
-        .ok_or_else(|| bad_request("ASR context snapshot has expired"))?;
+        .ok_or_else(|| bad_request("context_expired", "ASR context snapshot has expired"))?;
     let corrected_text = asr_snapshot.correct_recognition_proper_names(&request.recognized_text);
     let corrected_segments = request
         .segments
@@ -250,7 +310,7 @@ async fn prepare_translation(
             corrected_text: text,
         })
         .collect();
-    let context_id = insert_snapshot(session, snapshot);
+    let context_id = insert_snapshot(&mut session, snapshot);
     Ok(Json(PrepareTranslationResponse {
         context_id,
         corrected_text,
@@ -263,16 +323,19 @@ async fn record_translation(
     Path(session_id): Path<String>,
     Json(request): Json<RecordTranslationRequest>,
 ) -> ApiResult<RecordTranslationResponse> {
-    let mut sessions = state.sessions.lock().map_err(lock_error)?;
-    let session = sessions
-        .get_mut(&session_id)
-        .ok_or_else(session_not_found)?;
+    let session = find_session(&state, &session_id)?;
+    let mut session = session.lock().map_err(lock_error)?;
     session.last_used = Instant::now();
     let snapshot = session
         .snapshots
         .get(&request.context_id)
         .cloned()
-        .ok_or_else(|| bad_request("translation context snapshot has expired"))?;
+        .ok_or_else(|| {
+            bad_request(
+                "context_expired",
+                "translation context snapshot has expired",
+            )
+        })?;
     let term_matches = snapshot.translation_term_matches(
         &request.source_text,
         &request.translated_text,
@@ -303,6 +366,19 @@ fn budgets(value: ContextBudgets) -> (usize, usize) {
     (value.asr_tokens, value.translation_tokens)
 }
 
+fn find_session(
+    state: &AppState,
+    session_id: &str,
+) -> Result<Arc<Mutex<CorpusSession>>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .sessions
+        .lock()
+        .map_err(lock_error)?
+        .get(session_id)
+        .cloned()
+        .ok_or_else(session_not_found)
+}
+
 fn spawn_session_reaper(state: AppState) {
     tokio::spawn(async move {
         let interval =
@@ -314,7 +390,11 @@ fn spawn_session_reaper(state: AppState) {
                 continue;
             };
             let before = sessions.len();
-            sessions.retain(|_, session| session.last_used.elapsed() < state.session_ttl);
+            sessions.retain(|_, session| {
+                session
+                    .lock()
+                    .is_ok_and(|session| session.last_used.elapsed() < state.session_ttl)
+            });
             let removed = before.saturating_sub(sessions.len());
             if removed > 0 {
                 info!(removed, "expired idle XR Corpus sessions");
@@ -327,15 +407,20 @@ fn session_not_found() -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::NOT_FOUND,
         Json(ErrorResponse {
+            code: "session_not_found".into(),
             error: "corpus session does not exist".into(),
         }),
     )
 }
 
-fn bad_request(message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
+fn bad_request(
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::BAD_REQUEST,
         Json(ErrorResponse {
+            code: code.into(),
             error: message.into(),
         }),
     )
@@ -345,6 +430,7 @@ fn internal_error(message: impl ToString) -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorResponse {
+            code: "internal_error".into(),
             error: message.to_string(),
         }),
     )

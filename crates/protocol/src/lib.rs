@@ -1,6 +1,9 @@
 //! Versioned wire types for the XR Corpus local service.
 
 use serde::{Deserialize, Serialize};
+pub use xr_corpus_core::{
+    CORPUS_LANGUAGE_ORDER, CORPUS_SCHEMA, CorpusActivation, CorpusDefinition, CorpusTerm,
+};
 pub const API_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +26,8 @@ pub struct CorpusTermSource {
 pub struct HealthResponse {
     pub status: String,
     pub api_version: u16,
+    #[serde(default)]
+    pub server_version: String,
     pub corpus_count: usize,
     pub session_count: usize,
 }
@@ -33,6 +38,13 @@ pub struct CreateSessionRequest {}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateSessionResponse {
     pub session_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionStateResponse {
+    pub session_id: String,
+    pub active_corpus_ids: Vec<String>,
+    pub snapshot_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -96,7 +108,33 @@ pub struct RecordTranslationResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ErrorResponse {
+    #[serde(default = "default_error_code")]
+    pub code: String,
     pub error: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PublishProviderRequest {
+    /// Full atomic snapshot. Publishing again replaces the previous snapshot.
+    pub corpora: Vec<CorpusDefinition>,
+    /// Required expiry for runtime data. Accepted range: 5–3600 seconds.
+    #[serde(default = "default_provider_ttl_seconds")]
+    pub ttl_seconds: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProviderSnapshotResponse {
+    pub provider_id: String,
+    pub corpus_count: usize,
+    pub ttl_seconds: u64,
+}
+
+const fn default_provider_ttl_seconds() -> u64 {
+    60
+}
+
+fn default_error_code() -> String {
+    "unknown_error".to_owned()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

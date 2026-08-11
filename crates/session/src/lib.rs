@@ -227,6 +227,13 @@ pub struct PromptContextManager {
 }
 
 impl PromptContextManager {
+    /// Sorted IDs currently retained as session activation state.
+    pub fn active_corpus_ids(&self) -> Vec<String> {
+        let mut ids = self.active_corpus_ids.iter().cloned().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
     pub fn validate(config: &PromptContextConfig) -> Result<(), String> {
         if config.enabled && config.asr_max_chars < 256 {
             return Err("prompt_context.asr_max_chars must be at least 256 when enabled".into());
