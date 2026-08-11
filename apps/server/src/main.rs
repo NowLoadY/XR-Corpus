@@ -7,7 +7,10 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -20,6 +23,7 @@ use axum::{
 use clap::Parser;
 use serde::Deserialize;
 use tracing::{info, warn};
+use xr_corpus_core::{CorpusCatalog, CorpusConfig};
 use xr_corpus_protocol::{
     API_VERSION, ContextBudgets, CreateSessionRequest, CreateSessionResponse, ErrorResponse,
     HealthResponse, PrepareAsrRequest, PrepareAsrResponse, PrepareTranslationRequest,
@@ -27,7 +31,6 @@ use xr_corpus_protocol::{
     SegmentContext,
 };
 use xr_corpus_session::{PromptContextManager, PromptContextSnapshot};
-use xr_corpus_core::{CorpusCatalog, CorpusConfig};
 
 mod vrcx;
 
@@ -186,7 +189,9 @@ async fn prepare_asr(
     Json(request): Json<PrepareAsrRequest>,
 ) -> ApiResult<PrepareAsrResponse> {
     let mut sessions = state.sessions.lock().map_err(lock_error)?;
-    let session = sessions.get_mut(&session_id).ok_or_else(session_not_found)?;
+    let session = sessions
+        .get_mut(&session_id)
+        .ok_or_else(session_not_found)?;
     session.last_used = Instant::now();
     let snapshot = session
         .manager
@@ -211,7 +216,9 @@ async fn prepare_translation(
     Json(request): Json<PrepareTranslationRequest>,
 ) -> ApiResult<PrepareTranslationResponse> {
     let mut sessions = state.sessions.lock().map_err(lock_error)?;
-    let session = sessions.get_mut(&session_id).ok_or_else(session_not_found)?;
+    let session = sessions
+        .get_mut(&session_id)
+        .ok_or_else(session_not_found)?;
     session.last_used = Instant::now();
     let asr_snapshot = session
         .snapshots
@@ -257,7 +264,9 @@ async fn record_translation(
     Json(request): Json<RecordTranslationRequest>,
 ) -> ApiResult<RecordTranslationResponse> {
     let mut sessions = state.sessions.lock().map_err(lock_error)?;
-    let session = sessions.get_mut(&session_id).ok_or_else(session_not_found)?;
+    let session = sessions
+        .get_mut(&session_id)
+        .ok_or_else(session_not_found)?;
     session.last_used = Instant::now();
     let snapshot = session
         .snapshots
@@ -296,7 +305,8 @@ fn budgets(value: ContextBudgets) -> (usize, usize) {
 
 fn spawn_session_reaper(state: AppState) {
     tokio::spawn(async move {
-        let interval = (state.session_ttl / 2).clamp(Duration::from_secs(15), Duration::from_secs(60));
+        let interval =
+            (state.session_ttl / 2).clamp(Duration::from_secs(15), Duration::from_secs(60));
         loop {
             tokio::time::sleep(interval).await;
             let Ok(mut sessions) = state.sessions.lock() else {
@@ -314,15 +324,30 @@ fn spawn_session_reaper(state: AppState) {
 }
 
 fn session_not_found() -> (StatusCode, Json<ErrorResponse>) {
-    (StatusCode::NOT_FOUND, Json(ErrorResponse { error: "corpus session does not exist".into() }))
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "corpus session does not exist".into(),
+        }),
+    )
 }
 
 fn bad_request(message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
-    (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: message.into() }))
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: message.into(),
+        }),
+    )
 }
 
 fn internal_error(message: impl ToString) -> (StatusCode, Json<ErrorResponse>) {
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: message.to_string() }))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: message.to_string(),
+        }),
+    )
 }
 
 fn lock_error<T>(error: std::sync::PoisonError<T>) -> (StatusCode, Json<ErrorResponse>) {
@@ -330,10 +355,14 @@ fn lock_error<T>(error: std::sync::PoisonError<T>) -> (StatusCode, Json<ErrorRes
 }
 
 async fn shutdown_signal() {
-    let ctrl_c = async { let _ = tokio::signal::ctrl_c().await; };
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
     #[cfg(unix)]
     let terminate = async {
-        if let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        if let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
             signal.recv().await;
         }
     };

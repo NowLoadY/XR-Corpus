@@ -56,13 +56,27 @@ impl Default for CorpusConfig {
     }
 }
 
-const fn default_true() -> bool { true }
-const fn default_max_entries() -> usize { 6 }
-const fn default_asr_max_chars() -> usize { 800 }
-const fn default_translation_max_chars() -> usize { 1_200 }
-const fn default_asr_history_entries() -> usize { 1 }
-const fn default_translation_history_entries() -> usize { 6 }
-fn default_corpora_directory() -> PathBuf { PathBuf::from("corpora/v1") }
+const fn default_true() -> bool {
+    true
+}
+const fn default_max_entries() -> usize {
+    6
+}
+const fn default_asr_max_chars() -> usize {
+    800
+}
+const fn default_translation_max_chars() -> usize {
+    1_200
+}
+const fn default_asr_history_entries() -> usize {
+    1
+}
+const fn default_translation_history_entries() -> usize {
+    6
+}
+fn default_corpora_directory() -> PathBuf {
+    PathBuf::from("corpora/v1")
+}
 
 /// Controls how a corpus enters the prompt candidate set.
 ///

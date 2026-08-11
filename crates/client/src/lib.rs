@@ -85,7 +85,10 @@ impl CorpusSessionClient {
         &self.session_id
     }
 
-    pub async fn prepare_asr(&self, request: &PrepareAsrRequest) -> Result<PrepareAsrResponse, String> {
+    pub async fn prepare_asr(
+        &self,
+        request: &PrepareAsrRequest,
+    ) -> Result<PrepareAsrResponse, String> {
         self.client
             .post(&format!("/v1/sessions/{}/asr", self.session_id), request)
             .await
@@ -126,7 +129,8 @@ impl CorpusSessionClient {
             .send()
             .await
             .map_err(|error| format!("XR Corpus request failed: {error}"))?;
-        if response.status() == StatusCode::NO_CONTENT || response.status() == StatusCode::NOT_FOUND {
+        if response.status() == StatusCode::NO_CONTENT || response.status() == StatusCode::NOT_FOUND
+        {
             Ok(())
         } else {
             Err(response_error(response).await)

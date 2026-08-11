@@ -17,18 +17,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::{
-    Json,
-    extract::State,
-};
+use axum::{Json, extract::State};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::Deserialize;
 use tracing::{info, warn};
-use xr_corpus_protocol::VrcxStatusResponse;
 use xr_corpus_core::{
     CORPUS_LANGUAGE_ORDER, CORPUS_SCHEMA, CorpusActivation, CorpusDefinition, CorpusTerm,
     DynamicCorpusSource,
 };
+use xr_corpus_protocol::VrcxStatusResponse;
 
 use crate::AppState;
 
@@ -63,10 +60,18 @@ impl Default for VrcxIntegrationConfig {
     }
 }
 
-const fn default_enabled() -> bool { true }
-const fn default_snapshot_ttl_seconds() -> u64 { 30 }
-const fn default_max_players() -> usize { 80 }
-const fn default_poll_interval_ms() -> u64 { 2_000 }
+const fn default_enabled() -> bool {
+    true
+}
+const fn default_snapshot_ttl_seconds() -> u64 {
+    30
+}
+const fn default_max_players() -> usize {
+    80
+}
+const fn default_poll_interval_ms() -> u64 {
+    2_000
+}
 
 #[derive(Clone)]
 pub(crate) struct VrcxRuntimeSource {
@@ -302,9 +307,7 @@ impl VrcxRuntimeSource {
     }
 }
 
-pub(crate) async fn get_status(
-    State(state): State<AppState>,
-) -> Json<VrcxStatusResponse> {
+pub(crate) async fn get_status(State(state): State<AppState>) -> Json<VrcxStatusResponse> {
     Json(state.vrcx.status_response())
 }
 
