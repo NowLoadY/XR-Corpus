@@ -1,0 +1,23 @@
+[package]
+name = "xr-corpus-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local session and terminology service for XR Corpus."
+
+[dependencies]
+axum = "0.8.8"
+clap = { version = "4.5.58", features = ["derive"] }
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+xr-corpus-core = { path = "../../crates/core" }
+xr-corpus-protocol = { path = "../../crates/protocol" }
+xr-corpus-session = { path = "../../crates/session" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }

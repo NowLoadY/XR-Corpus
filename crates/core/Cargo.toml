@@ -1,0 +1,10 @@
+[package]
+name = "xr-corpus-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Versioned static and dynamic terminology catalog for XR Corpus."
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }

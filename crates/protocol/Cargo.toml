@@ -1,0 +1,10 @@
+[package]
+name = "xr-corpus-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Stable HTTP protocol shared by XR Corpus servers and clients."
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }

@@ -1,0 +1,19 @@
+{
+  "prompt_context": {
+    "enabled": true,
+    "max_entries": 6,
+    "asr_max_chars": 800,
+    "translation_max_chars": 1200,
+    "asr_history_entries": 1,
+    "translation_history_entries": 6,
+    "corpora_directory": "corpora/v1"
+  },
+  "integrations": {
+    "vrcx": {
+      "enabled": true,
+      "snapshot_ttl_seconds": 30,
+      "max_players": 80,
+      "poll_interval_ms": 2000
+    }
+  }
+}
