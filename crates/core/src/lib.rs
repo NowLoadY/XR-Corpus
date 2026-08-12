@@ -78,6 +78,10 @@ fn default_corpora_directory() -> PathBuf {
     PathBuf::from("corpora/v1")
 }
 
+fn default_corpus_activation() -> CorpusActivation {
+    CorpusActivation::OnEvidence
+}
+
 /// Controls how a corpus enters the prompt candidate set.
 ///
 /// Static Markdown corpora use [`Self::OnEvidence`]. Runtime providers may
@@ -85,13 +89,16 @@ fn default_corpora_directory() -> PathBuf {
 /// current VRChat world and player names. Always-active terms are also used as
 /// activation evidence for regular corpora, allowing a player called
 /// "Overwatch" or "Mercy" to activate an Overwatch terminology corpus without
-/// coupling the provider to that game's taxonomy.
+/// coupling the provider to that game's taxonomy. Runtime-only corpora still
+/// enter ASR/translation prompts, but their terms do not activate static
+/// corpora.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CorpusActivation {
     #[default]
     OnEvidence,
     Always,
+    RuntimeOnly,
 }
 
 /// One conceptual term with values stored in [`CORPUS_LANGUAGE_ORDER`].
@@ -169,7 +176,7 @@ pub struct CorpusDefinition {
     pub title: String,
     #[serde(default)]
     pub priority: i32,
-    #[serde(default)]
+    #[serde(default = "default_corpus_activation")]
     pub activation: CorpusActivation,
     #[serde(default)]
     pub triggers: Vec<CorpusTerm>,
@@ -238,16 +245,27 @@ impl CorpusDefinition {
     pub fn to_markdown(&self) -> Result<String, String> {
         self.validate()?;
         Ok(format!(
-            "# {}\n\n> 本文件遵循 `corpora/v1/SCHEMA.md`。每行一个概念，语言字段严格按固定顺序排列；缺失译名保留空列。\n\n## Metadata\n\nschema: {}\npriority: {}\n\n## Language Order\n\n{}\n\n## Triggers\n\n{}\n\n## Trigger Aliases\n\n{}\n\n## Activation Context\n\n{}\n\n## Terms\n\n{}\n",
+            "# {}\n\n> 本文件遵循 `corpora/v1/SCHEMA.md`。每行一个概念，语言字段严格按固定顺序排列；缺失译名保留空列。\n\n## Metadata\n\nschema: {}\npriority: {}\nactivation: {}\n\n## Language Order\n\n{}\n\n## Triggers\n\n{}\n\n## Trigger Aliases\n\n{}\n\n## Activation Context\n\n{}\n\n## Terms\n\n{}\n",
             self.title.trim(),
             self.schema,
             self.priority,
+            self.activation.as_metadata_value(),
             CORPUS_LANGUAGE_ORDER.join(","),
             render_terms(&self.triggers),
             render_terms(&self.trigger_aliases),
             render_terms(&self.activation_context),
             render_terms(&self.terms),
         ))
+    }
+}
+
+impl CorpusActivation {
+    fn as_metadata_value(self) -> &'static str {
+        match self {
+            Self::OnEvidence => "on-evidence",
+            Self::Always => "always",
+            Self::RuntimeOnly => "runtime-only",
+        }
     }
 }
 
@@ -461,18 +479,13 @@ pub fn load_markdown_directory(root: &Path) -> Result<Vec<CorpusDefinition>, Str
             require_file(&subdomain.join("subdomain.md"), "subdomain descriptor")?;
             let corpus_directory = subdomain.join("corpora");
             require_directory(&corpus_directory, "corpus leaf directory")?;
-            for path in child_files(&corpus_directory)? {
-                if path.extension().and_then(|value| value.to_str()) != Some("md") {
-                    return Err(format!(
-                        "corpus leaf directory contains a non-Markdown file: {}",
-                        path.display()
-                    ));
-                }
-                paths.push((domain_id.clone(), subdomain_id.clone(), path));
+            for path in corpus_files(&corpus_directory)? {
+                let file_id = corpus_file_id(&corpus_directory, &path)?;
+                paths.push((domain_id.clone(), subdomain_id.clone(), file_id, path));
             }
         }
     }
-    paths.sort_by(|left, right| left.2.cmp(&right.2));
+    paths.sort_by(|left, right| left.3.cmp(&right.3));
     if paths.len() > MAX_CORPUS_FILES {
         return Err(format!(
             "corpus root contains {} files; maximum is {MAX_CORPUS_FILES}",
@@ -481,7 +494,7 @@ pub fn load_markdown_directory(root: &Path) -> Result<Vec<CorpusDefinition>, Str
     }
 
     let mut corpora = Vec::with_capacity(paths.len());
-    for (domain_id, subdomain_id, path) in paths {
+    for (domain_id, subdomain_id, file_id, path) in paths {
         let metadata = fs::metadata(&path)
             .map_err(|error| format!("cannot inspect corpus {}: {error}", path.display()))?;
         if metadata.len() > MAX_CORPUS_BYTES {
@@ -493,10 +506,6 @@ pub fn load_markdown_directory(root: &Path) -> Result<Vec<CorpusDefinition>, Str
         }
         let markdown = fs::read_to_string(&path)
             .map_err(|error| format!("cannot read corpus {}: {error}", path.display()))?;
-        let file_id = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| format!("corpus has an invalid filename: {}", path.display()))?;
         let expected_id = format!("{domain_id}.{subdomain_id}.{file_id}");
         let mut corpus =
             parse_corpus_markdown(&markdown, &path, expected_id, domain_id, subdomain_id)?;
@@ -545,6 +554,12 @@ fn parse_corpus_markdown(
         ));
     }
 
+    let activation = optional_metadata_value(metadata, "activation")
+        .map(parse_activation)
+        .transpose()
+        .map_err(|error| format!("invalid corpus activation in {}: {error}", path.display()))?
+        .unwrap_or_default();
+
     Ok(CorpusDefinition {
         schema: schema.to_owned(),
         id,
@@ -552,7 +567,7 @@ fn parse_corpus_markdown(
         subdomain,
         title: title.to_owned(),
         priority,
-        activation: CorpusActivation::OnEvidence,
+        activation,
         triggers: parse_term_section(&lines, "Triggers", path)?,
         trigger_aliases: parse_optional_term_section(&lines, "Trigger Aliases", path)?,
         activation_context: parse_optional_term_section(&lines, "Activation Context", path)?,
@@ -606,6 +621,27 @@ fn metadata_value<'a>(lines: &'a [&str], key: &str, path: &Path) -> Result<&'a s
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("corpus {} metadata is missing {key:?}", path.display()))
+}
+
+fn optional_metadata_value<'a>(lines: &'a [&str], key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}:");
+    lines
+        .iter()
+        .map(|line| line.trim())
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_activation(value: &str) -> Result<CorpusActivation, String> {
+    match value {
+        "on-evidence" => Ok(CorpusActivation::OnEvidence),
+        "always" => Ok(CorpusActivation::Always),
+        "runtime-only" => Ok(CorpusActivation::RuntimeOnly),
+        _ => Err(format!(
+            "expected one of on-evidence, always, runtime-only; got {value:?}"
+        )),
+    }
 }
 
 fn parse_term_section(
@@ -700,8 +736,74 @@ fn child_directories(path: &Path) -> Result<Vec<PathBuf>, String> {
     children(path, true)
 }
 
-fn child_files(path: &Path) -> Result<Vec<PathBuf>, String> {
-    children(path, false)
+fn corpus_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    collect_corpus_files(root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_corpus_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    for entry in fs::read_dir(path)
+        .map_err(|error| format!("cannot enumerate {}: {error}", path.display()))?
+    {
+        let entry =
+            entry.map_err(|error| format!("cannot enumerate {}: {error}", path.display()))?;
+        let entry_path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect {}: {error}", entry_path.display()))?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "corpus hierarchy must not contain symlinks: {}",
+                entry_path.display()
+            ));
+        }
+        if file_type.is_dir() {
+            collect_corpus_files(&entry_path, files)?;
+        } else if file_type.is_file() {
+            if entry_path.extension().and_then(|value| value.to_str()) != Some("md") {
+                return Err(format!(
+                    "corpus directory contains a non-Markdown file: {}",
+                    entry_path.display()
+                ));
+            }
+            files.push(entry_path);
+        }
+    }
+    Ok(())
+}
+
+fn corpus_file_id(root: &Path, path: &Path) -> Result<String, String> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| format!("corpus file is outside root: {}", path.display()))?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let segment = component
+            .as_os_str()
+            .to_str()
+            .ok_or_else(|| format!("corpus path is not valid UTF-8: {}", path.display()))?;
+        let id = if segment.ends_with(".md") {
+            segment.trim_end_matches(".md")
+        } else {
+            segment
+        };
+        if !valid_qualified_id(id, false) {
+            return Err(format!(
+                "invalid corpus path segment {id:?} in {}",
+                path.display()
+            ));
+        }
+        parts.push(id.to_owned());
+    }
+    if parts.is_empty() {
+        return Err(format!(
+            "corpus file has no relative ID: {}",
+            path.display()
+        ));
+    }
+    Ok(parts.join("."))
 }
 
 fn children(path: &Path, directories: bool) -> Result<Vec<PathBuf>, String> {
@@ -837,6 +939,43 @@ mod tests {
     }
 
     #[test]
+    fn markdown_loader_uses_nested_corpus_paths_as_concept_ids() {
+        let root = temp_root("nested-corpus");
+        let leaf = root.join(
+            "corpora/v1/domains/entertainment/subdomains/anime-and-manga/corpora/works/sora-no-otoshimono/characters.md",
+        );
+        fs::create_dir_all(leaf.parent().unwrap()).unwrap();
+        fs::write(
+            root.join("corpora/v1/domains/entertainment/domain.md"),
+            "# Domain",
+        )
+        .unwrap();
+        fs::write(
+            root.join("corpora/v1/domains/entertainment/subdomains/anime-and-manga/subdomain.md"),
+            "# Subdomain",
+        )
+        .unwrap();
+        fs::write(
+            &leaf,
+            format!(
+                "# Characters\n\n> Fixed-order multilingual corpus.\n\n## Metadata\n\nschema: {CORPUS_SCHEMA}\npriority: 58\n\n## Language Order\n\n{}\n\n## Triggers\n\n{}\n\n## Terms\n\n{}\n",
+                CORPUS_LANGUAGE_ORDER.join(","),
+                term_row(&[("zh", "天降之物"), ("en", "Heaven's Lost Property")]),
+                term_row(&[("zh", "伊卡洛斯"), ("en", "Ikaros")]),
+            ),
+        )
+        .unwrap();
+
+        let catalog = CorpusCatalog::load(&CorpusConfig::default(), &root).unwrap();
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(
+            snapshot[0].id,
+            "entertainment.anime-and-manga.works.sora-no-otoshimono.characters"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn checked_in_corpora_follow_the_versioned_schema() {
         let project_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let catalog = CorpusCatalog::load(&CorpusConfig::default(), &project_root).unwrap();
@@ -857,6 +996,10 @@ mod tests {
                 .iter()
                 .any(|corpus| corpus.id == "technology.software-and-ai.frontier-models")
         );
+        assert!(snapshot.iter().any(|corpus| {
+            corpus.id == "internet-culture.memes.chinese-casual-teasing"
+                && corpus.title == "中文网络热梗调侃"
+        }));
     }
 
     #[test]

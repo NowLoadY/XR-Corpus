@@ -31,6 +31,7 @@ use crate::AppState;
 
 const PROVIDER_ID: &str = "vrcx";
 const RUNTIME_CORPUS_ID: &str = "virtual-worlds.vrchat.runtime-room";
+const GAME_MODE_CORPUS_ID: &str = "virtual-worlds.vrchat.runtime-game-mode";
 const DATABASE_FILE: &str = "VRCX.sqlite3";
 const VRCX_CONFIG_FILE: &str = "VRCX.json";
 
@@ -116,8 +117,10 @@ enum RefreshOutcome {
         database_path: PathBuf,
     },
     Available {
+        vrcx_running: bool,
+        vrchat_running: bool,
         database_path: PathBuf,
-        room: RoomSnapshot,
+        room: Option<RoomSnapshot>,
     },
 }
 
@@ -197,27 +200,24 @@ impl VrcxRuntimeSource {
         let processes = relevant_processes()?;
         let vrcx_running = processes.vrcx;
         let vrchat_running = processes.vrchat;
-        if !vrcx_running || !vrchat_running {
+        let database_path =
+            resolve_database_path(self.config.database_path.as_deref(), &self.project_root)
+                .unwrap_or_default();
+        if !vrchat_running {
             return Ok(RefreshOutcome::Unavailable {
                 vrcx_running,
                 vrchat_running,
-                database_path: resolve_database_path(
-                    self.config.database_path.as_deref(),
-                    &self.project_root,
-                )
-                .unwrap_or_default(),
+                database_path,
             });
         }
-        let database_path =
-            resolve_database_path(self.config.database_path.as_deref(), &self.project_root)?;
-        if !database_path.is_file() {
-            return Err(format!(
-                "VRCX database does not exist: {}",
-                database_path.display()
-            ));
-        }
-        let room = read_room_snapshot(&database_path, self.config.max_players)?;
+        let room = if vrcx_running && database_path.is_file() {
+            Some(read_room_snapshot(&database_path, self.config.max_players)?)
+        } else {
+            None
+        };
         Ok(RefreshOutcome::Available {
+            vrcx_running,
+            vrchat_running,
             database_path,
             room,
         })
@@ -242,25 +242,36 @@ impl VrcxRuntimeSource {
                 };
             }
             RefreshOutcome::Available {
+                vrcx_running,
+                vrchat_running,
                 database_path,
                 room,
             } => {
-                let corpus = room_corpus(&room)?;
-                let term_count = corpus.terms.len();
-                let player_count = room.players.len();
-                let world_name = room.world_name.clone();
+                let game_mode = game_mode_corpus()?;
+                let room_corpus = room.as_ref().map(room_corpus).transpose()?;
+                let term_count = game_mode.terms.len()
+                    + room_corpus.as_ref().map_or(0, |corpus| corpus.terms.len());
+                let player_count = room.as_ref().map_or(0, |room| room.players.len());
+                let world_name = room
+                    .as_ref()
+                    .map(|room| room.world_name.clone())
+                    .unwrap_or_default();
+                let mut corpora = vec![game_mode];
+                if let Some(room_corpus) = room_corpus {
+                    corpora.push(room_corpus);
+                }
                 self.dynamic_source.replace_snapshot(
                     PROVIDER_ID,
-                    vec![corpus],
+                    corpora,
                     Some(Duration::from_secs(self.config.snapshot_ttl_seconds)),
                 )?;
                 *self
                     .status
                     .write()
                     .map_err(|_| "VRCX status lock is poisoned".to_owned())? = RuntimeStatus {
-                    vrcx_running: true,
-                    vrchat_running: true,
-                    connected: true,
+                    vrcx_running,
+                    vrchat_running,
+                    connected: room.is_some(),
                     database_path,
                     world_name,
                     player_count,
@@ -450,7 +461,7 @@ fn room_corpus(room: &RoomSnapshot) -> Result<CorpusDefinition, String> {
         push_unique(&mut values, player);
     }
     if values.is_empty() {
-        values.push("VRChat".into());
+        values.push("Current VRChat room".into());
     }
     Ok(CorpusDefinition {
         schema: CORPUS_SCHEMA.into(),
@@ -459,14 +470,33 @@ fn room_corpus(room: &RoomSnapshot) -> Result<CorpusDefinition, String> {
         subdomain: "vrchat".into(),
         title: "Current VRChat room".into(),
         priority: 1_000,
-        activation: CorpusActivation::Always,
-        triggers: vec![multilingual_proper_name("VRChat")?],
+        activation: CorpusActivation::RuntimeOnly,
+        triggers: Vec::new(),
         trigger_aliases: Vec::new(),
         activation_context: Vec::new(),
         terms: values
             .iter()
             .map(|value| multilingual_proper_name(value))
             .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn game_mode_corpus() -> Result<CorpusDefinition, String> {
+    Ok(CorpusDefinition {
+        schema: CORPUS_SCHEMA.into(),
+        id: GAME_MODE_CORPUS_ID.into(),
+        domain: "virtual-worlds".into(),
+        subdomain: "vrchat".into(),
+        title: "Current game: VRChat".into(),
+        priority: 1_100,
+        activation: CorpusActivation::Always,
+        triggers: Vec::new(),
+        trigger_aliases: Vec::new(),
+        activation_context: Vec::new(),
+        terms: vec![
+            multilingual_proper_name("VRChat")?,
+            multilingual_proper_name("VRC")?,
+        ],
     })
 }
 
@@ -640,5 +670,36 @@ mod tests {
         assert_eq!(room.players, ["Bob", "MercyFan"]);
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn runtime_provider_separates_game_mode_from_room_facts() {
+        let room = RoomSnapshot {
+            world_name: "Overwatch Hub".into(),
+            group_name: "Game Night".into(),
+            region: "jp".into(),
+            players: vec!["MercyFan".into()],
+        };
+
+        let game_mode = game_mode_corpus().unwrap();
+        let room = room_corpus(&room).unwrap();
+
+        assert_eq!(game_mode.id, GAME_MODE_CORPUS_ID);
+        assert_eq!(game_mode.activation, CorpusActivation::Always);
+        assert!(
+            game_mode
+                .terms
+                .iter()
+                .any(|term| term.value("en") == Some("VRChat"))
+        );
+        assert_eq!(game_mode.terms.len(), 2);
+        assert_eq!(room.id, RUNTIME_CORPUS_ID);
+        assert_eq!(room.activation, CorpusActivation::RuntimeOnly);
+        assert!(room.triggers.is_empty());
+        assert!(
+            room.terms
+                .iter()
+                .any(|term| term.value("en") == Some("MercyFan"))
+        );
     }
 }

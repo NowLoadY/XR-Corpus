@@ -13,21 +13,22 @@ zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl
 
 ## Triggers
 
-VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat
 Avatar,Avatar,Avatar,Avatar,Avatar,Avatar,Avatar,Avatar,Avatar,Avatar,Avatar,Avatar,Avatar,Avatar,Avatar,Avatar
 OSC,OSC,OSC,OSC,OSC,OSC,OSC,OSC,OSC,OSC,OSC,OSC,OSC,OSC,OSC,OSC
 VRCSDK,VRCSDK,VRCSDK,VRCSDK,VRCSDK,VRCSDK,VRCSDK,VRCSDK,VRCSDK,VRCSDK,VRCSDK,VRCSDK,VRCSDK,VRCSDK,VRCSDK,VRCSDK
 
 ## Trigger Aliases
 
-VRC,VRC,VRC,VRC,VRC,VRC,VRC,VRC,VRC,VRC,VRC,VRC,VRC,VRC,VRC,VRC
-VR Chat,VR Chat,VR Chat,VR Chat,VR Chat,VR Chat,VR Chat,VR Chat,VR Chat,VR Chat,VR Chat,VR Chat,VR Chat,VR Chat,VR Chat,VR Chat
 Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi
 PhysBones,PhysBones,PhysBones,PhysBones,PhysBones,PhysBones,PhysBones,PhysBones,PhysBones,PhysBones,PhysBones,PhysBones,PhysBones,PhysBones,PhysBones,PhysBones
 Creator Companion,Creator Companion,Creator Companion,Creator Companion,Creator Companion,Creator Companion,Creator Companion,Creator Companion,Creator Companion,Creator Companion,Creator Companion,Creator Companion,Creator Companion,Creator Companion,Creator Companion,Creator Companion
 Udon,Udon,Udon,Udon,Udon,Udon,Udon,Udon,Udon,Udon,Udon,Udon,Udon,Udon,Udon,Udon
 后备头像,fallback avatar,,,,フォールバックアバター,,폴백 아바타,,,,,,,,
 替身 Avatar,avatar impostor,,,,アバターインポスター,,아바타 임포스터,,,,,,,,
+
+## Activation Context
+
+VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat
 
 ## Terms
 

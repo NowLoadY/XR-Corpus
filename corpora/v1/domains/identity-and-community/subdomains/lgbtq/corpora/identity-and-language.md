@@ -23,6 +23,8 @@ LGBTQ+,LGBTQ+,,,,LGBTQ+,ЛГБТК+,LGBTQ+,,,,,,,,
 
 ## Trigger Aliases
 
+LGBTQ+,LGBTQ,,,,LGBTQ,,LGBTQ,,,,,,,,
+LGBTQ+,L G B T Q,,,,L G B T Q,,L G B T Q,,,,,,,,
 性少数,sexual and gender minority,,,,性的・ジェンダーマイノリティ,,성소수자,,,,,,,,
 彩虹社群,rainbow community,,,,レインボーコミュニティ,,무지개 공동체,,,,,,,,
 同性恋者,homosexual,,,,同性愛者,,동성애자,,,,,,,,
@@ -38,6 +40,7 @@ aroace,aroace,aroace,aroace,aroace,aroace,aroace,aroace,aroace,aroace,aroace,aro
 ## Terms
 
 LGBTQ+,LGBTQ+,,,,LGBTQ+,ЛГБТК+,LGBTQ+,,,,,,,,
+LGBTQ,LGBTQ,,,,LGBTQ,,LGBTQ,,,,,,,,
 女同性恋,lesbian,,,,レズビアン,лесбиянка,레즈비언,,,,,,,,
 男同性恋,gay,,,,ゲイ,гей,게이,,,,,,,,
 双性恋,bisexual,,,,バイセクシュアル,бисексуал,양성애자,,,,,,,,

@@ -22,6 +22,21 @@ pub struct CorpusTermSource {
     pub title: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorpusPromptTerm {
+    pub values: Vec<(String, String)>,
+    pub sources: Vec<CorpusTermSource>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorpusRecognitionCorrection {
+    pub start_byte: u32,
+    pub end_byte: u32,
+    pub original_text: String,
+    pub corrected_text: String,
+    pub sources: Vec<CorpusTermSource>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
@@ -81,6 +96,10 @@ pub struct PrepareTranslationRequest {
 pub struct SegmentContext {
     pub corrected_text: String,
     pub prompt: Option<String>,
+    #[serde(default)]
+    pub prompt_terms: Vec<CorpusPromptTerm>,
+    #[serde(default)]
+    pub source_corrections: Vec<CorpusRecognitionCorrection>,
     pub activation_matches: Vec<CorpusTermMatch>,
     pub context_matches: Vec<CorpusTermMatch>,
 }
@@ -89,6 +108,8 @@ pub struct SegmentContext {
 pub struct PrepareTranslationResponse {
     pub context_id: u64,
     pub corrected_text: String,
+    #[serde(default)]
+    pub source_corrections: Vec<CorpusRecognitionCorrection>,
     pub segments: Vec<SegmentContext>,
 }
 

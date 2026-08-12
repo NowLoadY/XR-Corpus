@@ -13,7 +13,6 @@ zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl
 
 ## Triggers
 
-VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat
 实例,instance,instance,instância,instancia,インスタンス,инстанс,인스턴스,อินสแตนซ์,istanza,Instanz,phiên bản,instance,instancja,instance,instantie
 群组实例,group instance,,,,グループインスタンス,,그룹 인스턴스,,,,,,,,
 
@@ -27,6 +26,11 @@ VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRC
 加入我,join me,,,,参加して,,나에게 참가해,,,,,,,,
 公开房,public instance,,,,パブリックインスタンス,,공개 인스턴스,,,,,,,,
 好友房,friends instance,,,,フレンドインスタンス,,친구 인스턴스,,,,,,,,
+耳罩,Earmuffs,,,,イヤーマフ,,이어머프,,,,,,,,
+
+## Activation Context
+
+VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat
 
 ## Terms
 
@@ -41,7 +45,7 @@ Invite 实例,Invite instance,,,,Inviteインスタンス,,Invite 인스턴스,,
 信任等级,Trust Rank,,,,トラストランク,,신뢰 등급,,,,,,,,
 Quick Menu,Quick Menu,Quick Menu,Quick Menu,Quick Menu,Quick Menu,Quick Menu,Quick Menu,Quick Menu,Quick Menu,Quick Menu,Quick Menu,Quick Menu,Quick Menu,Quick Menu,Quick Menu
 Main Menu,Main Menu,Main Menu,Main Menu,Main Menu,Main Menu,Main Menu,Main Menu,Main Menu,Main Menu,Main Menu,Main Menu,Main Menu,Main Menu,Main Menu,Main Menu
-Earmuffs,Earmuffs,Earmuffs,Earmuffs,Earmuffs,Earmuffs,Earmuffs,Earmuffs,Earmuffs,Earmuffs,Earmuffs,Earmuffs,Earmuffs,Earmuffs,Earmuffs,Earmuffs
+耳罩,Earmuffs,,,,イヤーマフ,,이어머프,,,,,,,,
 
 ## Dynamic Boundary
 

@@ -280,40 +280,43 @@ async fn prepare_translation(
     let session = find_session(&state, &session_id)?;
     let mut session = session.lock().map_err(lock_error)?;
     session.last_used = Instant::now();
-    let asr_snapshot = session
-        .snapshots
-        .get(&request.asr_context_id)
-        .cloned()
-        .ok_or_else(|| bad_request("context_expired", "ASR context snapshot has expired"))?;
-    let corrected_text = asr_snapshot.correct_recognition_proper_names(&request.recognized_text);
-    let corrected_segments = request
-        .segments
-        .iter()
-        .map(|text| asr_snapshot.correct_recognition_proper_names(text))
-        .collect::<Vec<_>>();
+    if !session.snapshots.contains_key(&request.asr_context_id) {
+        return Err(bad_request(
+            "context_expired",
+            "ASR context snapshot has expired",
+        ));
+    }
     let snapshot = session
         .manager
         .select(
             &request.source_language,
             &request.target_language,
-            &[corrected_text.as_str()],
+            &[request.recognized_text.as_str()],
             budgets(request.budgets),
         )
         .map_err(internal_error)?;
-    session.manager.record_transcript(&corrected_text);
-    let segments = corrected_segments
-        .into_iter()
-        .map(|text| SegmentContext {
-            prompt: snapshot.translation_prompt_for(&text),
-            activation_matches: snapshot.activation_matches(&text),
-            context_matches: snapshot.recognition_context_matches(&text),
-            corrected_text: text,
+    let source_corrections = snapshot.recognition_corrections(&request.recognized_text);
+    session.manager.record_transcript(&request.recognized_text);
+    let segments = request
+        .segments
+        .iter()
+        .map(|text| {
+            let source_corrections = snapshot.recognition_corrections(text);
+            SegmentContext {
+                prompt: snapshot.translation_prompt_for(&text),
+                prompt_terms: snapshot.translation_prompt_terms_for(&text),
+                source_corrections,
+                activation_matches: snapshot.activation_matches(&text),
+                context_matches: snapshot.recognition_context_matches(&text),
+                corrected_text: text.clone(),
+            }
         })
         .collect();
     let context_id = insert_snapshot(&mut session, snapshot);
     Ok(Json(PrepareTranslationResponse {
         context_id,
-        corrected_text,
+        corrected_text: request.recognized_text,
+        source_corrections,
         segments,
     }))
 }

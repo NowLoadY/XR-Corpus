@@ -6,16 +6,19 @@
 //! pairs become bounded dialogue history, and full sentences never enter the
 //! ASR prompt.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 use xr_corpus_core::{
-    CorpusActivation, CorpusCatalog, CorpusConfig as PromptContextConfig, CorpusDefinition,
-    CorpusTerm, language_index,
+    CORPUS_LANGUAGE_ORDER, CorpusActivation, CorpusCatalog, CorpusConfig as PromptContextConfig,
+    CorpusDefinition, CorpusTerm, language_index,
 };
-use xr_corpus_protocol::{CorpusTermMatch, CorpusTermSource};
+use xr_corpus_protocol::{
+    CorpusPromptTerm, CorpusRecognitionCorrection, CorpusTermMatch, CorpusTermSource,
+};
 
 const MAX_HISTORY_TEXT_CHARS: usize = 240;
+const ACTIVE_CORPUS_IDLE_TURN_LIMIT: u8 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BilingualTurn {
@@ -31,12 +34,14 @@ struct BilingualTurn {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PromptContextSnapshot {
     languages: Vec<String>,
+    corpora: Vec<SelectedCorpus>,
     asr_prompt: Option<String>,
     asr_echo_guard: Vec<String>,
     translation_prompt: Option<String>,
     translation_terms: Vec<SelectedPromptTerm>,
     translation_history: Vec<BilingualTurn>,
     activation_terms: Vec<SelectedPromptTerm>,
+    recognition_context_terms: Vec<SelectedPromptTerm>,
 }
 
 impl PromptContextSnapshot {
@@ -69,6 +74,19 @@ impl PromptContextSnapshot {
             .then(|| render_translation_prompt(&self.languages, &rows, &turns))
     }
 
+    /// Returns the same admitted terminology concepts used by
+    /// [`Self::translation_prompt_for`], but as data instead of rendered prompt
+    /// text. Callers own any product-specific post-processing decisions.
+    pub fn translation_prompt_terms_for(&self, source_text: &str) -> Vec<CorpusPromptTerm> {
+        self.relevant_translation_terms(source_text)
+            .into_iter()
+            .map(|term| CorpusPromptTerm {
+                values: term.values.clone(),
+                sources: term.sources.clone(),
+            })
+            .collect()
+    }
+
     /// Matches only terms that were actually admitted to this request's
     /// translation prompt. The returned spans are authoritative UI metadata,
     /// not evidence inferred later from the full corpus catalogue.
@@ -95,26 +113,50 @@ impl PromptContextSnapshot {
     /// Source-side terminology belonging to the selected active corpora. UI
     /// clients render these more softly than state-changing activation terms.
     pub fn recognition_context_matches(&self, source_text: &str) -> Vec<CorpusTermMatch> {
-        match_selected_terms(source_text, &self.translation_terms, None)
+        match_selected_terms(source_text, &self.recognition_context_terms, None)
     }
 
-    /// Corrects a likely one-edit ASR spelling only when one long proper name
-    /// in the already-active terminology is the unique candidate. This is a
-    /// conservative lexical recovery pass, not general fuzzy matching.
-    pub fn correct_recognition_proper_names(&self, source_text: &str) -> String {
-        let candidates = self
-            .translation_terms
-            .iter()
-            .flat_map(|term| term.values.iter().map(|(_, value)| value.as_str()))
-            .filter(|value| {
-                value.chars().count() >= 8
-                    && value.chars().next().is_some_and(char::is_uppercase)
-                    && value
-                        .chars()
-                        .all(|character| character.is_ascii_alphabetic())
-            })
-            .collect::<HashSet<_>>();
-        correct_unique_near_words(source_text, &candidates)
+    /// Returns corpus-owned ASR correction candidates as data. Callers decide
+    /// whether to apply them and how to render the resulting matches.
+    pub fn recognition_corrections(&self, source_text: &str) -> Vec<CorpusRecognitionCorrection> {
+        let mut corrections = Vec::new();
+        for term in selected_recognition_correction_rows(&self.corpora, &self.languages) {
+            for (alias_language, alias) in &term.aliases {
+                for (start, end) in term_spans(source_text, alias) {
+                    let Some(canonical) = term
+                        .canonical
+                        .iter()
+                        .find(|(language, value)| language == alias_language && value != alias)
+                        .map(|(_, value)| value)
+                        .or_else(|| {
+                            term.canonical
+                                .iter()
+                                .find(|(_, value)| {
+                                    !value.trim().is_empty() && !value.eq_ignore_ascii_case(alias)
+                                })
+                                .map(|(_, value)| value)
+                        })
+                    else {
+                        continue;
+                    };
+                    if canonical.trim().is_empty() || canonical.eq_ignore_ascii_case(alias) {
+                        continue;
+                    }
+                    let (Ok(start_byte), Ok(end_byte)) = (u32::try_from(start), u32::try_from(end))
+                    else {
+                        continue;
+                    };
+                    corrections.push(CorpusRecognitionCorrection {
+                        start_byte,
+                        end_byte,
+                        original_text: source_text[start..end].to_owned(),
+                        corrected_text: canonical.clone(),
+                        sources: term.sources.clone(),
+                    });
+                }
+            }
+        }
+        select_non_overlapping_corrections(corrections)
     }
 
     /// Builds a compact second-pass context only when an admitted terminology
@@ -197,8 +239,31 @@ impl PromptContextSnapshot {
             .iter()
             .filter(|term| {
                 !match_selected_terms(source_text, std::slice::from_ref(*term), None).is_empty()
+                    || self.recognition_alias_matches_term(source_text, term)
             })
             .collect()
+    }
+
+    fn recognition_alias_matches_term(
+        &self,
+        source_text: &str,
+        selected: &SelectedPromptTerm,
+    ) -> bool {
+        selected_recognition_correction_rows(&self.corpora, &self.languages)
+            .into_iter()
+            .filter(|term| {
+                term.canonical.iter().any(|(_, canonical)| {
+                    selected
+                        .values
+                        .iter()
+                        .any(|(_, value)| values_equal(canonical, value))
+                })
+            })
+            .any(|term| {
+                term.aliases
+                    .iter()
+                    .any(|(_, alias)| !term_spans(source_text, alias).is_empty())
+            })
     }
 }
 
@@ -206,14 +271,23 @@ impl PromptContextSnapshot {
 struct SelectedPromptTerm {
     row: String,
     values: Vec<(String, String)>,
+    match_values: Vec<(String, String)>,
     sources: Vec<CorpusTermSource>,
 }
 
+struct RecognitionCorrectionTerm {
+    canonical: Vec<(String, String)>,
+    aliases: Vec<(String, String)>,
+    sources: Vec<CorpusTermSource>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct SelectedCorpus {
     definition: CorpusDefinition,
     matched_canonical_triggers: Vec<CorpusTerm>,
     current_triggers: Vec<CorpusTerm>,
     activation_triggers: Vec<CorpusTerm>,
+    currently_eligible: bool,
 }
 
 /// Per-session context state. Reset it whenever the audio/route generation
@@ -221,9 +295,12 @@ struct SelectedCorpus {
 pub struct PromptContextManager {
     config: PromptContextConfig,
     catalog: CorpusCatalog,
+    current_languages: Vec<String>,
     transcript_history: VecDeque<String>,
     dialogue_history: VecDeque<BilingualTurn>,
     active_corpus_ids: HashSet<String>,
+    active_corpus_idle_turns: HashMap<String, u8>,
+    dormant_corpus_ids: HashSet<String>,
 }
 
 impl PromptContextManager {
@@ -260,18 +337,41 @@ impl PromptContextManager {
     pub fn new(config: PromptContextConfig, catalog: CorpusCatalog) -> Result<Self, String> {
         Self::validate(&config)?;
         Ok(Self {
+            current_languages: Vec::new(),
             transcript_history: VecDeque::with_capacity(config.max_entries),
             dialogue_history: VecDeque::with_capacity(config.max_entries),
             active_corpus_ids: HashSet::new(),
+            active_corpus_idle_turns: HashMap::new(),
+            dormant_corpus_ids: HashSet::new(),
             config,
             catalog,
         })
     }
 
     pub fn reset(&mut self) {
+        self.current_languages.clear();
         self.transcript_history.clear();
         self.dialogue_history.clear();
         self.active_corpus_ids.clear();
+        self.active_corpus_idle_turns.clear();
+        self.dormant_corpus_ids.clear();
+    }
+
+    fn switch_languages(&mut self, languages: Vec<String>) -> Vec<String> {
+        if self.current_languages == languages {
+            return languages;
+        }
+        if self.current_languages.is_empty() {
+            self.current_languages = languages.clone();
+            return languages;
+        }
+        self.transcript_history.clear();
+        self.dialogue_history.clear();
+        self.active_corpus_ids.clear();
+        self.active_corpus_idle_turns.clear();
+        self.dormant_corpus_ids.clear();
+        self.current_languages = languages.clone();
+        languages
     }
 
     /// Stores successful, user-visible ASR output only as corpus activation
@@ -344,27 +444,18 @@ impl PromptContextManager {
             return Ok(PromptContextSnapshot::default());
         }
 
-        let languages = task_languages(source_language, target_language);
+        let languages = self.switch_languages(task_languages(source_language, target_language));
         if languages.is_empty() {
             return Ok(PromptContextSnapshot::default());
         }
-        let corpora = self.matching_corpora(&languages, hints)?;
-        let explicitly_matched = corpora
-            .iter()
-            .filter(|corpus| !corpus.current_triggers.is_empty())
-            .map(|corpus| corpus.definition.id.clone())
-            .collect::<HashSet<_>>();
-        if !explicitly_matched.is_empty() {
-            self.active_corpus_ids = explicitly_matched;
-        } else if !self.active_corpus_ids.is_empty()
-            && !corpora
-                .iter()
-                .any(|corpus| self.active_corpus_ids.contains(&corpus.definition.id))
-        {
-            self.active_corpus_ids.clear();
+        let mut corpora = self.matching_corpora(&languages, hints)?;
+        if self.update_active_corpora(&corpora, hints.iter().any(|hint| !hint.trim().is_empty())) {
+            corpora = self.matching_corpora(&languages, hints)?;
         }
         let terms = selected_term_rows(&corpora, &languages);
         let activation_terms = selected_activation_rows(&corpora, &languages);
+        let recognition_context_terms =
+            selected_recognition_context_rows(&corpora, &terms, &languages);
         let turns = self.relevant_turns(&languages);
         let asr_echo_guard = build_asr_echo_guard(
             &self.transcript_history,
@@ -381,12 +472,14 @@ impl PromptContextManager {
         );
         Ok(PromptContextSnapshot {
             languages,
+            corpora,
             asr_prompt: build_asr_prompt(&terms, self.config.asr_max_chars, token_budgets.0),
             asr_echo_guard,
             translation_prompt,
             translation_terms,
             translation_history,
             activation_terms,
+            recognition_context_terms,
         })
     }
 
@@ -398,6 +491,58 @@ impl PromptContextManager {
                     && languages.contains(&turn.target_language)
             })
             .collect()
+    }
+
+    fn update_active_corpora(&mut self, corpora: &[SelectedCorpus], advance_turn: bool) -> bool {
+        let explicitly_matched = corpora
+            .iter()
+            .filter(|corpus| {
+                corpus.definition.activation == CorpusActivation::OnEvidence
+                    && !corpus.current_triggers.is_empty()
+            })
+            .map(|corpus| corpus.definition.id.clone())
+            .collect::<HashSet<_>>();
+
+        if !explicitly_matched.is_empty() {
+            self.active_corpus_ids = explicitly_matched.clone();
+            self.active_corpus_idle_turns
+                .retain(|id, _| explicitly_matched.contains(id));
+            for id in explicitly_matched {
+                self.active_corpus_idle_turns.insert(id.clone(), 0);
+                self.dormant_corpus_ids.remove(&id);
+            }
+            return false;
+        }
+
+        if self.active_corpus_ids.is_empty() {
+            return false;
+        }
+
+        let selected_ids = corpora
+            .iter()
+            .map(|corpus| corpus.definition.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut changed = false;
+        for id in self.active_corpus_ids.clone() {
+            if !selected_ids.contains(id.as_str()) {
+                self.active_corpus_ids.remove(&id);
+                self.active_corpus_idle_turns.remove(&id);
+                changed = true;
+                continue;
+            }
+            if !advance_turn {
+                continue;
+            }
+            let idle_turns = self.active_corpus_idle_turns.entry(id.clone()).or_insert(0);
+            *idle_turns = idle_turns.saturating_add(1);
+            if *idle_turns >= ACTIVE_CORPUS_IDLE_TURN_LIMIT {
+                self.active_corpus_ids.remove(&id);
+                self.active_corpus_idle_turns.remove(&id);
+                self.dormant_corpus_ids.insert(id);
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn matching_corpora(
@@ -424,8 +569,9 @@ impl PromptContextManager {
         // history entries. Confirmed active state is retained separately.
         let mut activation_evidence = current_evidence.clone();
         let snapshot = self.catalog.snapshot()?;
-        // Runtime `Always` corpora (for example the current VRCX room) are
-        // prompt data and activation evidence for regular static corpora.
+        // Runtime `Always` corpora provide mode evidence. Runtime-only corpora
+        // remain prompt data, but they do not activate static specialist
+        // glossaries by themselves.
         for corpus in snapshot
             .iter()
             .filter(|corpus| corpus.activation == CorpusActivation::Always)
@@ -452,92 +598,58 @@ impl PromptContextManager {
                     .triggers
                     .iter()
                     .chain(corpus.trigger_aliases.iter())
-                    .filter(|term| {
-                        languages
-                            .iter()
-                            .filter_map(|language| term.value(language))
-                            .map(fold_for_match)
-                            .any(|keyword| evidence_contains_term(&evidence, &keyword))
-                    })
+                    .filter(|term| term_matches_evidence(term, &evidence))
                     .cloned()
                     .collect::<Vec<_>>();
                 let matched_canonical_triggers = corpus
                     .triggers
                     .iter()
-                    .filter(|term| {
-                        languages
-                            .iter()
-                            .filter_map(|language| term.value(language))
-                            .map(fold_for_match)
-                            .any(|keyword| evidence_contains_term(&evidence, &keyword))
-                    })
+                    .filter(|term| term_matches_evidence(term, &evidence))
                     .cloned()
                     .collect::<Vec<_>>();
                 let matched_activation_context = corpus
                     .activation_context
                     .iter()
-                    .filter(|term| {
-                        languages
-                            .iter()
-                            .filter_map(|language| term.value(language))
-                            .map(fold_for_match)
-                            .any(|keyword| evidence_contains_term(&evidence, &keyword))
-                    })
+                    .filter(|term| term_matches_evidence(term, &evidence))
                     .cloned()
                     .collect::<Vec<_>>();
                 let current_matched_triggers = corpus
                     .triggers
                     .iter()
                     .chain(corpus.trigger_aliases.iter())
-                    .filter(|term| {
-                        languages
-                            .iter()
-                            .filter_map(|language| term.value(language))
-                            .map(fold_for_match)
-                            .any(|keyword| evidence_contains_term(&activation_evidence, &keyword))
-                    })
+                    .filter(|term| term_matches_evidence(term, &activation_evidence))
                     .cloned()
                     .collect::<Vec<_>>();
                 let current_activation_context = corpus
                     .activation_context
                     .iter()
-                    .filter(|term| {
-                        languages
-                            .iter()
-                            .filter_map(|language| term.value(language))
-                            .map(fold_for_match)
-                            .any(|keyword| evidence_contains_term(&activation_evidence, &keyword))
-                    })
+                    .filter(|term| term_matches_evidence(term, &activation_evidence))
                     .cloned()
                     .collect::<Vec<_>>();
                 let activation_context_satisfied =
                     corpus.activation_context.is_empty() || !current_activation_context.is_empty();
+                let current_speech_triggers = current_matched_triggers
+                    .iter()
+                    .filter(|term| term_matches_evidence(term, &current_evidence))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let dormant = self.dormant_corpus_ids.contains(&corpus.id);
                 let newly_eligible =
                     !current_matched_triggers.is_empty() && activation_context_satisfied;
-                let unconstrained_history_eligible =
-                    corpus.activation_context.is_empty() && !matched_triggers.is_empty();
+                let unconstrained_history_eligible = corpus.activation_context.is_empty()
+                    && !matched_triggers.is_empty()
+                    && !dormant;
                 let eligible = corpus.activation == CorpusActivation::Always
+                    || corpus.activation == CorpusActivation::RuntimeOnly
                     || newly_eligible
                     || unconstrained_history_eligible
                     || self.active_corpus_ids.contains(&corpus.id);
-                let current_triggers = if corpus.activation == CorpusActivation::OnEvidence
-                    && newly_eligible
-                {
-                    current_matched_triggers
-                        .iter()
-                        .chain(corpus.activation_context.iter())
-                        .filter(|term| {
-                            languages
-                                .iter()
-                                .filter_map(|language| term.value(language))
-                                .map(fold_for_match)
-                                .any(|keyword| evidence_contains_term(&current_evidence, &keyword))
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>()
-                } else {
-                    Vec::new()
-                };
+                let current_triggers =
+                    if corpus.activation == CorpusActivation::OnEvidence && newly_eligible {
+                        current_speech_triggers
+                    } else {
+                        Vec::new()
+                    };
                 let activation_triggers = if self.active_corpus_ids.contains(&corpus.id) {
                     Vec::new()
                 } else {
@@ -556,6 +668,7 @@ impl PromptContextManager {
                         matched_canonical_triggers,
                         current_triggers,
                         activation_triggers,
+                        currently_eligible: newly_eligible,
                     },
                 ))
             })
@@ -566,11 +679,14 @@ impl PromptContextManager {
         if has_current_activation {
             matches.retain(|(_, _, _, corpus)| {
                 corpus.definition.activation == CorpusActivation::Always
+                    || corpus.definition.activation == CorpusActivation::RuntimeOnly
+                    || corpus.currently_eligible
                     || !corpus.current_triggers.is_empty()
             });
         } else if !self.active_corpus_ids.is_empty() {
             matches.retain(|(_, _, _, corpus)| {
                 corpus.definition.activation == CorpusActivation::Always
+                    || corpus.definition.activation == CorpusActivation::RuntimeOnly
                     || self.active_corpus_ids.contains(&corpus.definition.id)
             });
         }
@@ -623,92 +739,6 @@ fn split_identifier_words(value: &str) -> String {
     expanded
 }
 
-fn correct_unique_near_words(source_text: &str, candidates: &HashSet<&str>) -> String {
-    let mut corrected = String::with_capacity(source_text.len());
-    let mut word_start = None;
-    for (index, character) in source_text.char_indices() {
-        if character.is_ascii_alphabetic() {
-            word_start.get_or_insert(index);
-            continue;
-        }
-        if let Some(start) = word_start.take() {
-            let word = &source_text[start..index];
-            corrected.push_str(unique_near_candidate(word, candidates).unwrap_or(word));
-        }
-        corrected.push(character);
-    }
-    if let Some(start) = word_start {
-        let word = &source_text[start..];
-        corrected.push_str(unique_near_candidate(word, candidates).unwrap_or(word));
-    }
-    corrected
-}
-
-fn unique_near_candidate<'a>(word: &str, candidates: &'a HashSet<&'a str>) -> Option<&'a str> {
-    if word.len() < 8
-        || candidates
-            .iter()
-            .any(|candidate| candidate.eq_ignore_ascii_case(word))
-    {
-        return None;
-    }
-    let mut matches = candidates.iter().copied().filter(|candidate| {
-        candidate
-            .as_bytes()
-            .first()
-            .zip(word.as_bytes().first())
-            .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
-            && is_single_edit_apart(candidate, word)
-    });
-    let first = matches.next();
-    if first.is_some() && matches.next().is_none() {
-        first
-    } else {
-        None
-    }
-}
-
-fn is_single_edit_apart(left: &str, right: &str) -> bool {
-    let left = left.to_ascii_lowercase().into_bytes();
-    let right = right.to_ascii_lowercase().into_bytes();
-    if left.len().abs_diff(right.len()) > 1 {
-        return false;
-    }
-    if left.len() == right.len() {
-        let differences = left
-            .iter()
-            .zip(&right)
-            .enumerate()
-            .filter_map(|(index, (left, right))| (left != right).then_some(index))
-            .collect::<Vec<_>>();
-        return differences.len() == 1
-            || (differences.len() == 2
-                && differences[1] == differences[0] + 1
-                && left[differences[0]] == right[differences[1]]
-                && left[differences[1]] == right[differences[0]]);
-    }
-    let (shorter, longer) = if left.len() < right.len() {
-        (&left, &right)
-    } else {
-        (&right, &left)
-    };
-    let mut short = 0;
-    let mut long = 0;
-    let mut skipped = false;
-    while short < shorter.len() && long < longer.len() {
-        if shorter[short] == longer[long] {
-            short += 1;
-            long += 1;
-        } else if skipped {
-            return false;
-        } else {
-            skipped = true;
-            long += 1;
-        }
-    }
-    true
-}
-
 fn normalized_language_code(value: &str) -> String {
     value
         .trim()
@@ -747,7 +777,7 @@ fn selected_term_rows(corpora: &[SelectedCorpus], languages: &[String]) -> Vec<S
                 .definition
                 .terms
                 .iter()
-                .filter(|term| terms_overlap(trigger, term, languages))
+                .filter(|term| terms_overlap(trigger, term))
                 .collect::<Vec<_>>();
             for term in authoritative_terms {
                 insert_selected_term(&mut rows, &mut seen, &corpus.definition, term, languages);
@@ -756,7 +786,7 @@ fn selected_term_rows(corpora: &[SelectedCorpus], languages: &[String]) -> Vec<S
                 .definition
                 .terms
                 .iter()
-                .any(|term| terms_overlap(trigger, term, languages))
+                .any(|term| terms_overlap(trigger, term))
                 && is_multilingual_mapping(trigger, languages)
             {
                 insert_selected_term(&mut rows, &mut seen, &corpus.definition, trigger, languages);
@@ -786,16 +816,12 @@ fn selected_term_rows(corpora: &[SelectedCorpus], languages: &[String]) -> Vec<S
     rows
 }
 
-fn terms_overlap(left: &CorpusTerm, right: &CorpusTerm, languages: &[String]) -> bool {
-    let left_values = languages
-        .iter()
-        .filter_map(|language| left.value(language))
+fn terms_overlap(left: &CorpusTerm, right: &CorpusTerm) -> bool {
+    let left_values = term_all_values(left)
         .map(fold_for_match)
         .filter(|value| !value.is_empty())
         .collect::<HashSet<_>>();
-    languages
-        .iter()
-        .filter_map(|language| right.value(language))
+    term_all_values(right)
         .map(fold_for_match)
         .any(|value| !value.is_empty() && left_values.contains(&value))
 }
@@ -820,6 +846,85 @@ fn selected_activation_rows(
     for corpus in corpora {
         for trigger in &corpus.activation_triggers {
             insert_selected_term(&mut rows, &mut seen, &corpus.definition, trigger, languages);
+        }
+    }
+    rows
+}
+
+fn selected_recognition_context_rows(
+    corpora: &[SelectedCorpus],
+    terms: &[SelectedPromptTerm],
+    languages: &[String],
+) -> Vec<SelectedPromptTerm> {
+    let mut rows = terms.to_vec();
+    let mut seen = rows
+        .iter()
+        .map(|term| term.row.to_lowercase())
+        .collect::<HashSet<_>>();
+    for corpus in corpora {
+        for trigger in corpus
+            .matched_canonical_triggers
+            .iter()
+            .chain(corpus.current_triggers.iter())
+        {
+            insert_selected_term(&mut rows, &mut seen, &corpus.definition, trigger, languages);
+        }
+    }
+    rows
+}
+
+fn selected_recognition_correction_rows(
+    corpora: &[SelectedCorpus],
+    languages: &[String],
+) -> Vec<RecognitionCorrectionTerm> {
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+    for corpus in corpora {
+        for alias in &corpus.definition.trigger_aliases {
+            let Some(canonical) = corpus
+                .definition
+                .terms
+                .iter()
+                .find(|term| terms_overlap(alias, term))
+            else {
+                continue;
+            };
+            let alias_values = task_term_values(alias, languages);
+            let canonical_values = task_term_values(canonical, languages);
+            let correction_aliases = alias_values
+                .iter()
+                .filter(|(alias_language, alias_value)| {
+                    !canonical_values
+                        .iter()
+                        .any(|(canonical_language, canonical_value)| {
+                            canonical_language == alias_language
+                                && values_equal(canonical_value, alias_value)
+                        })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if correction_aliases.is_empty() {
+                continue;
+            }
+            let row_key = canonical_values
+                .iter()
+                .chain(correction_aliases.iter())
+                .map(|(language, value)| format!("{language}:{}", fold_for_match(value)))
+                .collect::<Vec<_>>()
+                .join("\u{1f}");
+            if !seen.insert(format!("{}:{row_key}", corpus.definition.id)) {
+                continue;
+            }
+            rows.push(RecognitionCorrectionTerm {
+                canonical: canonical_values,
+                aliases: correction_aliases,
+                sources: vec![CorpusTermSource {
+                    corpus_id: corpus.definition.id.clone(),
+                    domain: corpus.definition.domain.clone(),
+                    subdomain: corpus.definition.subdomain.clone(),
+                    title: corpus.definition.title.clone(),
+                }],
+            });
         }
     }
     rows
@@ -854,16 +959,49 @@ fn insert_selected_term(
         return;
     }
     rows.push(SelectedPromptTerm {
-        values: languages
-            .iter()
-            .filter_map(|language| {
-                term.value(language)
-                    .map(|value| (language.clone(), value.to_owned()))
-            })
-            .collect(),
+        values: task_term_values(term, languages),
+        match_values: all_term_values(term),
         row,
         sources: vec![source],
     });
+}
+
+fn term_matches_evidence(term: &CorpusTerm, evidence: &str) -> bool {
+    term_all_values(term)
+        .map(fold_for_match)
+        .any(|keyword| evidence_contains_term(evidence, &keyword))
+}
+
+fn term_all_values(term: &CorpusTerm) -> impl Iterator<Item = &str> {
+    term.ordered_values
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn task_term_values(term: &CorpusTerm, languages: &[String]) -> Vec<(String, String)> {
+    languages
+        .iter()
+        .filter_map(|language| {
+            term.value(language)
+                .map(|value| (language.clone(), value.to_owned()))
+        })
+        .collect()
+}
+
+fn all_term_values(term: &CorpusTerm) -> Vec<(String, String)> {
+    CORPUS_LANGUAGE_ORDER
+        .iter()
+        .filter_map(|language| {
+            term.value(language)
+                .map(|value| ((*language).to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+fn values_equal(left: &str, right: &str) -> bool {
+    fold_for_match(left) == fold_for_match(right)
 }
 
 fn selected_term_row(term: &CorpusTerm, languages: &[String]) -> String {
@@ -1004,6 +1142,44 @@ fn build_translation_prompt(
     (prompt, admitted_terms, admitted_history)
 }
 
+fn term_spans(text: &str, term: &str) -> Vec<(usize, usize)> {
+    let folded_text = FoldedText::new(text);
+    let folded_value = fold_for_match(term);
+    if folded_value.is_empty() {
+        return Vec::new();
+    }
+    folded_text
+        .text
+        .match_indices(&folded_value)
+        .filter_map(|(folded_start, _)| {
+            let folded_end = folded_start + folded_value.len();
+            term_boundary_matches(&folded_text.text, folded_start, folded_end, &folded_value)
+                .then(|| folded_text.original_span(folded_start, folded_end))
+                .flatten()
+        })
+        .collect()
+}
+
+fn select_non_overlapping_corrections(
+    mut corrections: Vec<CorpusRecognitionCorrection>,
+) -> Vec<CorpusRecognitionCorrection> {
+    corrections.sort_by(|left, right| {
+        left.start_byte
+            .cmp(&right.start_byte)
+            .then_with(|| right.end_byte.cmp(&left.end_byte))
+    });
+    let mut selected: Vec<CorpusRecognitionCorrection> = Vec::new();
+    for correction in corrections {
+        if selected.iter().any(|existing| {
+            correction.start_byte < existing.end_byte && correction.end_byte > existing.start_byte
+        }) {
+            continue;
+        }
+        selected.push(correction);
+    }
+    selected
+}
+
 fn match_selected_terms(
     text: &str,
     terms: &[SelectedPromptTerm],
@@ -1014,7 +1190,7 @@ fn match_selected_terms(
     let mut candidates = Vec::new();
     for term in terms {
         let mut seen_values = HashSet::new();
-        for (value_language, value) in &term.values {
+        for (value_language, value) in &term.match_values {
             if normalized_language
                 .as_ref()
                 .is_some_and(|language| language != value_language)
@@ -1267,10 +1443,15 @@ mod tests {
     }
 
     fn bilingual_term(zh: &str, en: &str) -> CorpusTerm {
-        let mut values = vec![String::new(); xr_corpus_core::CORPUS_LANGUAGE_ORDER.len()];
-        values[language_index("zh").unwrap()] = zh.into();
-        values[language_index("en").unwrap()] = en.into();
-        CorpusTerm::from_ordered(values).unwrap()
+        term_from_values(&[("zh", zh), ("en", en)])
+    }
+
+    fn term_from_values(values: &[(&str, &str)]) -> CorpusTerm {
+        let mut row = vec![String::new(); xr_corpus_core::CORPUS_LANGUAGE_ORDER.len()];
+        for (language, value) in values {
+            row[language_index(language).unwrap()] = (*value).into();
+        }
+        CorpusTerm::from_ordered(row).unwrap()
     }
 
     fn catalog() -> CorpusCatalog {
@@ -1433,6 +1614,104 @@ mod tests {
     }
 
     #[test]
+    fn route_language_change_discards_old_language_context_and_columns() {
+        let corpus = CorpusDefinition {
+            schema: xr_corpus_core::CORPUS_SCHEMA.into(),
+            id: "games.overwatch.heroes".into(),
+            domain: "games".into(),
+            subdomain: "overwatch".into(),
+            title: "Overwatch Heroes".into(),
+            priority: 70,
+            activation: CorpusActivation::OnEvidence,
+            triggers: vec![term_from_values(&[
+                ("zh", "zh-game"),
+                ("en", "Overwatch"),
+                ("ja", "ja-game"),
+            ])],
+            trigger_aliases: Vec::new(),
+            activation_context: Vec::new(),
+            terms: vec![term_from_values(&[
+                ("zh", "zh-only-hero"),
+                ("en", "Mercy"),
+                ("ja", "ja-only-hero"),
+            ])],
+        };
+        let mut context = PromptContextManager::new(
+            config(),
+            CorpusCatalog::from_definitions(vec![corpus]).unwrap(),
+        )
+        .unwrap();
+
+        let zh_en = context
+            .select("auto", "zh,en", &["Overwatch"], (1_000, 1_000))
+            .unwrap();
+        assert!(zh_en.asr_prompt().unwrap().contains("zh-only-hero"));
+        assert!(
+            zh_en
+                .translation_prompt_for("Mercy")
+                .unwrap()
+                .contains("zh-only-hero,Mercy")
+        );
+        context.record_transcript("Overwatch Mercy");
+        context.record_translation("en", "zh", "Mercy", "zh-only-hero");
+
+        let ja_en = context
+            .select("ja", "en", &["Overwatch"], (1_000, 1_000))
+            .unwrap();
+        let asr = ja_en.asr_prompt().unwrap();
+        assert!(asr.contains("ja-only-hero"));
+        assert!(asr.contains("Mercy"));
+        assert!(!asr.contains("zh-only-hero"));
+
+        let prompt = ja_en.translation_prompt_for("Mercy").unwrap();
+        assert!(prompt.contains("## Language Order\n\nja,en"));
+        assert!(prompt.contains("ja-only-hero,Mercy"));
+        assert!(!prompt.contains("zh-only-hero"));
+        assert!(!prompt.contains("zh:"));
+    }
+
+    #[test]
+    fn bidirectional_route_uses_only_the_configured_language_pair() {
+        let corpus = CorpusDefinition {
+            schema: xr_corpus_core::CORPUS_SCHEMA.into(),
+            id: "games.overwatch.heroes".into(),
+            domain: "games".into(),
+            subdomain: "overwatch".into(),
+            title: "Overwatch Heroes".into(),
+            priority: 70,
+            activation: CorpusActivation::OnEvidence,
+            triggers: vec![term_from_values(&[
+                ("zh", "zh-game"),
+                ("en", "Overwatch"),
+                ("ja", "ja-game"),
+            ])],
+            trigger_aliases: Vec::new(),
+            activation_context: Vec::new(),
+            terms: vec![term_from_values(&[
+                ("zh", "zh-only-hero"),
+                ("en", "Mercy"),
+                ("ja", "ja-only-hero"),
+            ])],
+        };
+        let mut context = PromptContextManager::new(
+            config(),
+            CorpusCatalog::from_definitions(vec![corpus]).unwrap(),
+        )
+        .unwrap();
+
+        let snapshot = context
+            .select("auto", "ja,en", &["Overwatch"], (1_000, 1_000))
+            .unwrap();
+        let prompt = snapshot.translation_prompt_for("Mercy").unwrap();
+
+        assert!(prompt.contains("## Language Order\n\nja,en"));
+        assert!(prompt.contains("ja-only-hero,Mercy"));
+        assert!(!prompt.contains("zh-only-hero"));
+        assert!(!prompt.contains("zh,en"));
+        assert!(!prompt.contains("zh:"));
+    }
+
+    #[test]
     fn a_new_explicit_domain_replaces_stale_specialist_context() {
         let catalog = CorpusCatalog::from_definitions(vec![
             corpus(
@@ -1508,6 +1787,135 @@ mod tests {
         assert!(translation.contains("MercyFan,MercyFan"));
         assert!(translation.contains("安娜,Ana"));
         assert!(translation.contains("天使,Mercy"));
+    }
+
+    #[test]
+    fn default_platform_terms_do_not_depend_on_runtime_integrations() {
+        let catalog = CorpusCatalog::from_definitions(vec![corpus(
+            "games.multiplayer.platforms",
+            10,
+            CorpusActivation::Always,
+            &[],
+            &[("VRChat", "VRChat")],
+        )])
+        .unwrap();
+        let mut context = PromptContextManager::new(config(), catalog).unwrap();
+
+        let snapshot = context
+            .select("auto", "zh,en", &[], (1_000, 1_000))
+            .unwrap();
+
+        let asr = snapshot.asr_prompt().unwrap();
+        assert!(asr.contains("VRChat"));
+    }
+
+    #[test]
+    fn vrchat_runtime_game_mode_selects_daily_chat_without_specialist_topics() {
+        let daily = corpus(
+            "virtual-worlds.vrchat.community-language",
+            65,
+            CorpusActivation::OnEvidence,
+            &[("VRChat", "VRChat")],
+            &[("男娘", "femboy"), ("摸摸", "headpat")],
+        );
+        let mut avatar = corpus(
+            "virtual-worlds.vrchat.avatar-osc",
+            55,
+            CorpusActivation::OnEvidence,
+            &[("Avatar", "Avatar"), ("OSC", "OSC")],
+            &[("面部追踪", "face tracking")],
+        );
+        avatar.activation_context = vec![bilingual_term("VRChat", "VRChat")];
+        let catalog = CorpusCatalog::from_definitions(vec![daily, avatar]).unwrap();
+        catalog
+            .dynamic_source()
+            .replace_snapshot(
+                "vrcx",
+                vec![corpus(
+                    "virtual-worlds.vrchat.runtime-game-mode",
+                    1_100,
+                    CorpusActivation::Always,
+                    &[],
+                    &[("VRChat", "VRChat")],
+                )],
+                None,
+            )
+            .unwrap();
+
+        let mut context = PromptContextManager::new(config(), catalog).unwrap();
+        let snapshot = context
+            .select("auto", "zh,en", &["hi everyone"], (1_000, 1_000))
+            .unwrap();
+        let prompt = snapshot.translation_prompt().unwrap();
+        assert!(prompt.contains("男娘,femboy"));
+        assert!(prompt.contains("摸摸,headpat"));
+        assert!(!prompt.contains("面部追踪,face tracking"));
+        assert!(snapshot.activation_matches("hi everyone").is_empty());
+    }
+
+    #[test]
+    fn specialist_context_decays_back_to_vrchat_daily_chat() {
+        let daily = corpus(
+            "virtual-worlds.vrchat.community-language",
+            65,
+            CorpusActivation::OnEvidence,
+            &[("VRChat", "VRChat")],
+            &[("男娘", "femboy")],
+        );
+        let mut avatar = corpus(
+            "virtual-worlds.vrchat.avatar-osc",
+            55,
+            CorpusActivation::OnEvidence,
+            &[("Avatar", "Avatar")],
+            &[("面部追踪", "face tracking")],
+        );
+        avatar.activation_context = vec![bilingual_term("VRChat", "VRChat")];
+        let catalog = CorpusCatalog::from_definitions(vec![daily, avatar]).unwrap();
+        catalog
+            .dynamic_source()
+            .replace_snapshot(
+                "vrcx",
+                vec![corpus(
+                    "virtual-worlds.vrchat.runtime-game-mode",
+                    1_100,
+                    CorpusActivation::Always,
+                    &[],
+                    &[("VRChat", "VRChat")],
+                )],
+                None,
+            )
+            .unwrap();
+
+        let mut context = PromptContextManager::new(config(), catalog).unwrap();
+        let avatar_turn = context
+            .select(
+                "auto",
+                "zh,en",
+                &["My Avatar face tracking broke"],
+                (1_000, 1_000),
+            )
+            .unwrap();
+        assert!(
+            avatar_turn
+                .translation_prompt()
+                .unwrap()
+                .contains("面部追踪,face tracking")
+        );
+
+        for text in ["hello", "what are you doing", "nice to meet you"] {
+            context.record_transcript(text);
+            context.record_translation("en", "zh", text, "你好");
+            let _ = context
+                .select("auto", "zh,en", &[text], (1_000, 1_000))
+                .unwrap();
+        }
+
+        let follow_up = context
+            .select("auto", "zh,en", &["just chatting"], (1_000, 1_000))
+            .unwrap();
+        let prompt = follow_up.translation_prompt().unwrap();
+        assert!(prompt.contains("男娘,femboy"));
+        assert!(!prompt.contains("面部追踪,face tracking"));
     }
 
     #[test]
@@ -1649,27 +2057,224 @@ mod tests {
     }
 
     #[test]
-    fn active_terms_conservatively_correct_one_edit_proper_names() {
-        let catalog = CorpusCatalog::from_definitions(vec![corpus(
-            "games.overwatch.heroes",
-            70,
-            CorpusActivation::OnEvidence,
-            &[("守望先锋", "Overwatch")],
-            &[("莱因哈特", "Reinhardt"), ("死神", "Reaper")],
-        )])
-        .unwrap();
+    fn checked_in_vrc_alias_does_not_activate_avatar_authoring_terms() {
+        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
+        let mut casual = PromptContextManager::new(config(), catalog.clone()).unwrap();
+
+        let casual_snapshot = casual
+            .select("auto", "zh,en", &["Let's meet in VRC"], (1_000, 1_000))
+            .unwrap();
+        let casual_prompt = casual_snapshot.translation_prompt().unwrap();
+        assert!(casual_prompt.contains("男娘,femboy"));
+        assert!(!casual_prompt.contains("Avatar Dynamics"));
+
+        let mut authoring = PromptContextManager::new(config(), catalog).unwrap();
+        let authoring_snapshot = authoring
+            .select(
+                "auto",
+                "zh,en",
+                &["My VRChat Avatar has broken PhysBones"],
+                (1_000, 1_000),
+            )
+            .unwrap();
+        assert!(
+            authoring_snapshot
+                .translation_prompt()
+                .unwrap()
+                .contains("Avatar Dynamics")
+        );
+    }
+
+    #[test]
+    fn checked_in_vrc_alias_can_correct_rare_word_on_first_turn() {
+        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
         let mut context = PromptContextManager::new(config(), catalog).unwrap();
+
         let snapshot = context
-            .select("auto", "zh,en", &["I play Overwatch"], (1_000, 1_000))
+            .select(
+                "auto",
+                "zh,en",
+                &["Yeah, you are a fanboy."],
+                (1_000, 1_000),
+            )
+            .unwrap();
+        let corrections = snapshot.recognition_corrections("Yeah, you are a fanboy.");
+
+        assert_eq!(corrections.len(), 1);
+        assert_eq!(corrections[0].original_text, "fanboy");
+        assert_eq!(corrections[0].corrected_text, "femboy");
+        assert_eq!(
+            corrections[0].sources[0].corpus_id,
+            "virtual-worlds.vrchat.community-language"
+        );
+        let prompt = snapshot
+            .translation_prompt_for("Yeah, you are a fanboy.")
+            .unwrap();
+        assert!(prompt.contains("男娘,femboy"));
+        assert!(!prompt.contains("fanboy"));
+    }
+
+    #[test]
+    fn checked_in_lgbtq_spelled_letters_activate_identity_terms() {
+        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
+        let mut context = PromptContextManager::new(config(), catalog).unwrap();
+
+        let snapshot = context
+            .select("auto", "zh,en", &["Do you know L G B T Q?"], (1_000, 1_000))
+            .unwrap();
+        let prompt = snapshot.translation_prompt().unwrap();
+        let matches = snapshot.activation_matches("Do you know L G B T Q?");
+
+        assert!(prompt.contains("LGBTQ,LGBTQ"));
+        assert!(prompt.contains("跨性别,transgender"));
+        assert_eq!(matches[0].text, "L G B T Q");
+        assert_eq!(
+            matches[0].sources[0].corpus_id,
+            "identity-and-community.lgbtq.identity-and-language"
+        );
+    }
+
+    #[test]
+    fn checked_in_chinese_meme_seed_activates_small_teasing_cluster() {
+        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
+        let mut context = PromptContextManager::new(config(), catalog).unwrap();
+
+        let snapshot = context
+            .select("auto", "zh,en", &["今天满脑子咕咕嘎嘎。"], (1_000, 1_000))
+            .unwrap();
+        let prompt = snapshot.translation_prompt().unwrap();
+
+        assert!(prompt.contains("咕咕嘎嘎,Gugu Gaga"));
+        assert!(prompt.contains("你充Q币吗,do you recharge Q coins"));
+        let matches = snapshot.activation_matches("今天满脑子咕咕嘎嘎。");
+        assert_eq!(matches[0].text, "咕咕嘎嘎");
+        assert_eq!(
+            matches[0].sources[0].corpus_id,
+            "internet-culture.memes.chinese-casual-teasing"
+        );
+    }
+
+    #[test]
+    fn checked_in_chinese_meme_corpus_ignores_ordinary_teasing() {
+        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
+        let mut context = PromptContextManager::new(config(), catalog).unwrap();
+
+        let snapshot = context
+            .select("auto", "zh,en", &["你今天说话好搞笑。"], (1_000, 1_000))
             .unwrap();
 
+        assert!(
+            snapshot
+                .translation_prompt()
+                .is_none_or(|prompt| !prompt.contains("你充Q币吗"))
+        );
+        assert!(snapshot.activation_matches("你今天说话好搞笑。").is_empty());
+    }
+
+    #[test]
+    fn checked_in_chinese_meme_alias_activates_without_becoming_prompt_term() {
+        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
+        let mut context = PromptContextManager::new(config(), catalog).unwrap();
+
+        let snapshot = context
+            .select("auto", "zh,en", &["你冲Q币吗？"], (1_000, 1_000))
+            .unwrap();
+        let prompt = snapshot.translation_prompt().unwrap();
+
+        assert!(prompt.contains("你充Q币吗,do you recharge Q coins"));
+        assert!(!prompt.contains("你冲Q币吗"));
         assert_eq!(
-            snapshot.correct_recognition_proper_names("Rainhardt you know"),
-            "Reinhardt you know"
+            snapshot.activation_matches("你冲Q币吗？")[0].text,
+            "你冲Q币吗"
+        );
+    }
+
+    #[test]
+    fn checked_in_work_corpus_activates_from_title_or_character() {
+        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
+
+        let mut from_title = PromptContextManager::new(config(), catalog.clone()).unwrap();
+        let title_snapshot = from_title
+            .select("auto", "zh,en", &["Do you know 天降之物?"], (1_000, 1_000))
+            .unwrap();
+        let title_prompt = title_snapshot.translation_prompt().unwrap();
+        assert!(title_prompt.contains("伊卡洛斯,Ikaros"));
+        assert!(title_prompt.contains("阿斯特蕾亚,Astraea"));
+
+        let mut from_character = PromptContextManager::new(config(), catalog).unwrap();
+        let character_snapshot = from_character
+            .select("auto", "zh,en", &["Ikaros is my favorite"], (1_000, 1_000))
+            .unwrap();
+        let character_prompt = character_snapshot.translation_prompt().unwrap();
+        assert!(character_prompt.contains("天降之物,Heaven's Lost Property"));
+        assert!(character_prompt.contains("妮姆芙,Nymph"));
+    }
+
+    #[test]
+    fn checked_in_work_corpus_activates_from_non_route_language_alias() {
+        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
+
+        let mut from_japanese = PromptContextManager::new(config(), catalog.clone()).unwrap();
+        let japanese_snapshot = from_japanese
+            .select("auto", "zh,en", &["イカロス。"], (1_000, 1_000))
+            .unwrap();
+        let japanese_prompt = japanese_snapshot.translation_prompt().unwrap();
+        assert!(japanese_prompt.contains("伊卡洛斯,Ikaros"));
+        assert!(!japanese_prompt.contains("イカロス"));
+        assert_eq!(
+            japanese_snapshot.activation_matches("イカロス。")[0].text,
+            "イカロス"
+        );
+
+        let mut from_mixed = PromptContextManager::new(config(), catalog).unwrap();
+        let mixed_snapshot = from_mixed
+            .select("auto", "zh,en", &["伊卡ロス。"], (1_000, 1_000))
+            .unwrap();
+        assert!(
+            mixed_snapshot
+                .translation_prompt()
+                .unwrap()
+                .contains("伊卡洛斯,Ikaros")
         );
         assert_eq!(
-            snapshot.correct_recognition_proper_names("The reader knows"),
-            "The reader knows"
+            mixed_snapshot.activation_matches("伊卡ロス。")[0].text,
+            "伊卡ロス"
+        );
+    }
+
+    #[test]
+    fn checked_in_active_work_title_remains_recognition_context() {
+        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
+        let mut context = PromptContextManager::new(config(), catalog).unwrap();
+
+        let first = context
+            .select("auto", "zh,en", &["你知道伊卡洛斯吗？"], (1_000, 1_000))
+            .unwrap();
+        assert_eq!(
+            first.activation_matches("你知道伊卡洛斯吗？")[0].text,
+            "伊卡洛斯"
+        );
+        context.record_transcript("你知道伊卡洛斯吗？");
+        context.record_translation("zh", "en", "你知道伊卡洛斯吗？", "Do you know Ikaros?");
+
+        let second = context
+            .select("auto", "zh,en", &["嗯，天降之物的。"], (1_000, 1_000))
+            .unwrap();
+        let matches = second.recognition_context_matches("嗯，天降之物的。");
+        assert_eq!(matches[0].text, "天降之物");
+        assert!(
+            matches[0].sources[0]
+                .corpus_id
+                .ends_with("sora-no-otoshimono.characters")
         );
     }
 
