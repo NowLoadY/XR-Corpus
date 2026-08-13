@@ -285,6 +285,7 @@ struct SelectedCorpus {
     definition: CorpusDefinition,
     matched_canonical_triggers: Vec<CorpusTerm>,
     current_triggers: Vec<CorpusTerm>,
+    current_terms: Vec<CorpusTerm>,
     activation_triggers: Vec<CorpusTerm>,
     currently_eligible: bool,
 }
@@ -364,6 +365,19 @@ impl PromptContextManager {
             self.current_languages = languages.clone();
             return languages;
         }
+        // Automatic bidirectional routing reverses source and target on every
+        // speaker-language change (for example [en, zh] -> [zh, en]). That is
+        // still the same conversation language pair, so retain topic and
+        // history state while updating the prompt column order for this turn.
+        let same_language_set = self.current_languages.len() == languages.len()
+            && self
+                .current_languages
+                .iter()
+                .all(|language| languages.contains(language));
+        if same_language_set {
+            self.current_languages = languages.clone();
+            return languages;
+        }
         self.transcript_history.clear();
         self.dialogue_history.clear();
         self.active_corpus_ids.clear();
@@ -439,6 +453,26 @@ impl PromptContextManager {
         hints: &[&str],
         token_budgets: (usize, usize),
     ) -> Result<PromptContextSnapshot, String> {
+        self.select_observation(
+            source_language,
+            target_language,
+            hints,
+            token_budgets,
+            hints.iter().any(|hint| !hint.trim().is_empty()),
+        )
+    }
+
+    /// Selects context for one streaming observation. `advance_turn` must be
+    /// true only for the first observation of a user utterance; later
+    /// revisions may refresh a matching active topic but cannot decay it.
+    pub fn select_observation(
+        &mut self,
+        source_language: &str,
+        target_language: &str,
+        hints: &[&str],
+        token_budgets: (usize, usize),
+        advance_turn: bool,
+    ) -> Result<PromptContextSnapshot, String> {
         if !self.config.enabled {
             return Ok(PromptContextSnapshot::default());
         }
@@ -448,7 +482,7 @@ impl PromptContextManager {
             return Ok(PromptContextSnapshot::default());
         }
         let mut corpora = self.matching_corpora(&languages, hints)?;
-        if self.update_active_corpora(&corpora, hints.iter().any(|hint| !hint.trim().is_empty())) {
+        if self.update_active_corpora(&corpora, advance_turn) {
             corpora = self.matching_corpora(&languages, hints)?;
         }
         let terms = selected_term_rows(&corpora, &languages);
@@ -467,15 +501,14 @@ impl PromptContextManager {
             &turns,
             self.config.asr_history_entries,
         );
-        let (translation_prompt, translation_terms, translation_history) =
-            build_translation_prompt(
-                &languages,
-                &translation_candidates,
-                &turns,
-                self.config.translation_history_entries,
-                self.config.translation_max_chars,
-                token_budgets.1,
-            );
+        let (translation_prompt, translation_terms, translation_history) = build_translation_prompt(
+            &languages,
+            &translation_candidates,
+            &turns,
+            self.config.translation_history_entries,
+            self.config.translation_max_chars,
+            token_budgets.1,
+        );
         Ok(PromptContextSnapshot {
             languages,
             corpora,
@@ -534,6 +567,17 @@ impl PromptContextManager {
                 self.active_corpus_ids.remove(&id);
                 self.active_corpus_idle_turns.remove(&id);
                 changed = true;
+                continue;
+            }
+            // Once a specialist corpus is active, a matching terminology row
+            // is evidence that the conversation is still on that topic. Terms
+            // deliberately do not activate a dormant corpus on their own: many
+            // of them are ordinary words outside their specialist context.
+            let term_matched = corpora
+                .iter()
+                .any(|corpus| corpus.definition.id == id && !corpus.current_terms.is_empty());
+            if term_matched {
+                self.active_corpus_idle_turns.insert(id, 0);
                 continue;
             }
             if !advance_turn {
@@ -639,6 +683,12 @@ impl PromptContextManager {
                     .filter(|term| term_matches_evidence(term, &current_evidence))
                     .cloned()
                     .collect::<Vec<_>>();
+                let current_terms = corpus
+                    .terms
+                    .iter()
+                    .filter(|term| term_matches_evidence(term, &current_evidence))
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let dormant = self.dormant_corpus_ids.contains(&corpus.id);
                 let newly_eligible =
                     !current_matched_triggers.is_empty() && activation_context_satisfied;
@@ -673,6 +723,7 @@ impl PromptContextManager {
                         definition: corpus,
                         matched_canonical_triggers,
                         current_triggers,
+                        current_terms,
                         activation_triggers,
                         currently_eligible: newly_eligible,
                     },
@@ -1656,22 +1707,50 @@ mod tests {
             .translation_prompt_for("I played Reinhardt.")
             .unwrap();
         assert!(prompt.contains("莱因哈特,Reinhardt"));
-        let matches = snapshot.translation_term_matches(
-            "I played Reinhardt.",
-            "我玩莱因哈特。",
-            "zh",
-        );
+        let matches =
+            snapshot.translation_term_matches("I played Reinhardt.", "我玩莱因哈特。", "zh");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].text, "莱因哈特");
         assert!(
             snapshot
-                .translation_term_matches(
-                    "Long Placeholder Term 39",
-                    "很长的占位术语39",
-                    "zh",
-                )
+                .translation_term_matches("Long Placeholder Term 39", "很长的占位术语39", "zh",)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn bidirectional_direction_change_preserves_active_topic() {
+        let corpus = CorpusDefinition {
+            schema: xr_corpus_core::CORPUS_SCHEMA.into(),
+            id: "games.overwatch.heroes".into(),
+            domain: "games".into(),
+            subdomain: "overwatch".into(),
+            title: "Overwatch Heroes".into(),
+            priority: 70,
+            activation: CorpusActivation::OnEvidence,
+            triggers: vec![term_from_values(&[("zh", "zh-game"), ("en", "Overwatch")])],
+            trigger_aliases: Vec::new(),
+            activation_context: Vec::new(),
+            terms: vec![term_from_values(&[("zh", "zh-angel"), ("en", "Mercy")])],
+        };
+        let mut context = PromptContextManager::new(
+            config(),
+            CorpusCatalog::from_definitions(vec![corpus]).unwrap(),
+        )
+        .unwrap();
+
+        context
+            .select("en", "zh", &["Overwatch"], (1_000, 1_000))
+            .unwrap();
+        assert_eq!(context.active_corpus_ids(), vec!["games.overwatch.heroes"]);
+
+        let reversed = context
+            .select("zh", "en", &["zh-angel"], (1_000, 1_000))
+            .unwrap();
+        assert_eq!(context.active_corpus_ids(), vec!["games.overwatch.heroes"]);
+        let prompt = reversed.translation_prompt_for("zh-angel").unwrap();
+        assert!(prompt.contains("## Language Order\n\nzh,en"));
+        assert!(prompt.contains("zh-angel,Mercy"));
     }
 
     #[test]
@@ -1977,6 +2056,108 @@ mod tests {
         let prompt = follow_up.translation_prompt().unwrap();
         assert!(prompt.contains("男娘,femboy"));
         assert!(!prompt.contains("面部追踪,face tracking"));
+    }
+
+    #[test]
+    fn active_corpus_term_match_refreshes_topic_decay_without_reactivating_it() {
+        let catalog = CorpusCatalog::from_definitions(vec![corpus(
+            "games.overwatch.heroes",
+            70,
+            CorpusActivation::OnEvidence,
+            &[("守望先锋", "Overwatch")],
+            &[("天使", "Mercy")],
+        )])
+        .unwrap();
+        let mut context = PromptContextManager::new(config(), catalog).unwrap();
+
+        let activated = context
+            .select("auto", "zh,en", &["Overwatch"], (1_000, 1_000))
+            .unwrap();
+        assert!(
+            activated
+                .translation_prompt()
+                .unwrap()
+                .contains("天使,Mercy")
+        );
+
+        for text in ["hello", "how are you"] {
+            let _ = context
+                .select("auto", "zh,en", &[text], (1_000, 1_000))
+                .unwrap();
+        }
+
+        // Mercy is terminology, not an activation trigger. It keeps the
+        // already-active specialist topic alive for this turn.
+        let mercy_turn = context
+            .select("auto", "zh,en", &["Mercy"], (1_000, 1_000))
+            .unwrap();
+        assert!(
+            mercy_turn
+                .translation_prompt()
+                .unwrap()
+                .contains("天使,Mercy")
+        );
+        assert!(mercy_turn.activation_matches("Mercy").is_empty());
+
+        for text in ["nice", "thanks"] {
+            let _ = context
+                .select("auto", "zh,en", &[text], (1_000, 1_000))
+                .unwrap();
+        }
+        let still_active = context
+            .select("auto", "zh,en", &[], (1_000, 1_000))
+            .unwrap();
+        assert!(
+            still_active
+                .translation_prompt()
+                .unwrap()
+                .contains("天使,Mercy")
+        );
+    }
+
+    #[test]
+    fn streaming_revisions_advance_topic_decay_only_once_per_turn() {
+        let catalog = CorpusCatalog::from_definitions(vec![corpus(
+            "games.overwatch.heroes",
+            70,
+            CorpusActivation::OnEvidence,
+            &[("Overwatch", "Overwatch")],
+            &[("Mercy-zh", "Mercy")],
+        )])
+        .unwrap();
+        let mut context = PromptContextManager::new(config(), catalog).unwrap();
+
+        context
+            .select_observation("auto", "zh,en", &["Overwatch"], (1_000, 1_000), true)
+            .unwrap();
+        context
+            .select_observation("auto", "zh,en", &["hello"], (1_000, 1_000), true)
+            .unwrap();
+
+        // Repeated provisional windows from the same utterance must not spend
+        // the remaining idle-turn allowance.
+        for revision in ["hello there", "hello there friend", "hello there friend!"] {
+            context
+                .select_observation("auto", "zh,en", &[revision], (1_000, 1_000), false)
+                .unwrap();
+        }
+        assert_eq!(context.active_corpus_ids(), vec!["games.overwatch.heroes"]);
+
+        // A later revision containing an in-domain term refreshes the topic
+        // even though it does not count as another turn.
+        context
+            .select_observation("auto", "zh,en", &["Mercy"], (1_000, 1_000), false)
+            .unwrap();
+        for text in ["one", "two"] {
+            context
+                .select_observation("auto", "zh,en", &[text], (1_000, 1_000), true)
+                .unwrap();
+        }
+        assert_eq!(context.active_corpus_ids(), vec!["games.overwatch.heroes"]);
+        context
+            .select_observation("auto", "zh,en", &["three"], (1_000, 1_000), true)
+            .unwrap();
+        assert!(context.active_corpus_ids().is_empty());
     }
 
     #[test]

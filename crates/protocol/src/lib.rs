@@ -85,6 +85,10 @@ pub struct PrepareAsrResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrepareTranslationRequest {
     pub asr_context_id: u64,
+    /// Stable identifier for one user utterance. Streaming revisions of the
+    /// same utterance reuse this value so topic decay advances only once.
+    #[serde(default)]
+    pub turn_id: Option<String>,
     pub source_language: String,
     pub target_language: String,
     pub recognized_text: String,

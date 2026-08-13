@@ -4,7 +4,7 @@
 //! bounded bilingual history and immutable per-request context snapshots.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     path::PathBuf,
     sync::{
@@ -35,6 +35,7 @@ use xr_corpus_session::{PromptContextManager, PromptContextSnapshot};
 mod vrcx;
 
 const MAX_SNAPSHOTS_PER_SESSION: usize = 12;
+const MAX_OBSERVED_TURNS_PER_SESSION: usize = 64;
 
 #[derive(Debug, Parser)]
 #[command(name = "xr-corpus-server", version, about = "XR Corpus local service")]
@@ -61,8 +62,32 @@ struct AppState {
 struct CorpusSession {
     manager: PromptContextManager,
     snapshots: HashMap<u64, PromptContextSnapshot>,
+    observed_turn_ids: HashSet<String>,
+    observed_turn_order: VecDeque<String>,
     next_context_id: u64,
     last_used: Instant,
+}
+
+impl CorpusSession {
+    fn should_advance_topic(&mut self, turn_id: Option<&str>, has_text: bool) -> bool {
+        if !has_text {
+            return false;
+        }
+        let Some(turn_id) = turn_id.map(str::trim).filter(|value| !value.is_empty()) else {
+            // Backward compatibility for clients predating turn IDs.
+            return true;
+        };
+        if !self.observed_turn_ids.insert(turn_id.to_owned()) {
+            return false;
+        }
+        self.observed_turn_order.push_back(turn_id.to_owned());
+        while self.observed_turn_order.len() > MAX_OBSERVED_TURNS_PER_SESSION {
+            if let Some(expired) = self.observed_turn_order.pop_front() {
+                self.observed_turn_ids.remove(&expired);
+            }
+        }
+        true
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,6 +198,8 @@ async fn create_session(
         Arc::new(Mutex::new(CorpusSession {
             manager,
             snapshots: HashMap::new(),
+            observed_turn_ids: HashSet::new(),
+            observed_turn_order: VecDeque::new(),
             next_context_id: 1,
             last_used: Instant::now(),
         })),
@@ -286,13 +313,18 @@ async fn prepare_translation(
             "ASR context snapshot has expired",
         ));
     }
+    let advance_topic = session.should_advance_topic(
+        request.turn_id.as_deref(),
+        !request.recognized_text.trim().is_empty(),
+    );
     let snapshot = session
         .manager
-        .select(
+        .select_observation(
             &request.source_language,
             &request.target_language,
             &[request.recognized_text.as_str()],
             budgets(request.budgets),
+            advance_topic,
         )
         .map_err(internal_error)?;
     let source_corrections = snapshot.recognition_corrections(&request.recognized_text);
