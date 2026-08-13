@@ -74,9 +74,8 @@ impl PromptContextSnapshot {
             .then(|| render_translation_prompt(&self.languages, &rows, &turns))
     }
 
-    /// Returns the same admitted terminology concepts used by
-    /// [`Self::translation_prompt_for`], but as data instead of rendered prompt
-    /// text. Callers own any product-specific post-processing decisions.
+    /// Returns terminology directly relevant to this source window and
+    /// admitted to the model prompt.
     pub fn translation_prompt_terms_for(&self, source_text: &str) -> Vec<CorpusPromptTerm> {
         self.relevant_translation_terms(source_text)
             .into_iter()
@@ -87,9 +86,9 @@ impl PromptContextSnapshot {
             .collect()
     }
 
-    /// Matches only terms that were actually admitted to this request's
-    /// translation prompt. The returned spans are authoritative UI metadata,
-    /// not evidence inferred later from the full corpus catalogue.
+    /// Matches terms admitted to this source window's model prompt. The
+    /// returned spans are authoritative UI metadata, not evidence inferred
+    /// from translated text alone.
     pub fn translation_term_matches(
         &self,
         source_text: &str,
@@ -453,6 +452,12 @@ impl PromptContextManager {
             corpora = self.matching_corpora(&languages, hints)?;
         }
         let terms = selected_term_rows(&corpora, &languages);
+        let mut translation_candidates = terms.clone();
+        translation_candidates.sort_by_key(|term| {
+            !hints.iter().any(|hint| {
+                !match_selected_terms(hint, std::slice::from_ref(term), None).is_empty()
+            })
+        });
         let activation_terms = selected_activation_rows(&corpora, &languages);
         let recognition_context_terms =
             selected_recognition_context_rows(&corpora, &terms, &languages);
@@ -462,14 +467,15 @@ impl PromptContextManager {
             &turns,
             self.config.asr_history_entries,
         );
-        let (translation_prompt, translation_terms, translation_history) = build_translation_prompt(
-            &languages,
-            &terms,
-            &turns,
-            self.config.translation_history_entries,
-            self.config.translation_max_chars,
-            token_budgets.1,
-        );
+        let (translation_prompt, translation_terms, translation_history) =
+            build_translation_prompt(
+                &languages,
+                &translation_candidates,
+                &turns,
+                self.config.translation_history_entries,
+                self.config.translation_max_chars,
+                token_budgets.1,
+            );
         Ok(PromptContextSnapshot {
             languages,
             corpora,
@@ -1102,7 +1108,7 @@ fn build_translation_prompt(
         if candidate.chars().count() > term_budget
             || estimated_prompt_tokens(&candidate) > token_budget * 3 / 5
         {
-            break;
+            continue;
         }
         selected_terms = candidate_terms;
     }
@@ -1611,6 +1617,61 @@ mod tests {
                 .any(|value| value == "我喜欢天使。")
         );
         assert!(following_turn.activation_matches("Mercy").is_empty());
+    }
+
+    #[test]
+    fn current_source_term_survives_general_prompt_budget_truncation() {
+        let mut terms = (0..40)
+            .map(|index| {
+                term_from_values(&[
+                    ("zh", &format!("很长的占位术语{index:02}")),
+                    ("en", &format!("Long Placeholder Term {index:02}")),
+                ])
+            })
+            .collect::<Vec<_>>();
+        terms.push(term_from_values(&[("zh", "莱因哈特"), ("en", "Reinhardt")]));
+        let definition = CorpusDefinition {
+            schema: xr_corpus_core::CORPUS_SCHEMA.into(),
+            id: "games.overwatch.heroes".into(),
+            domain: "games".into(),
+            subdomain: "overwatch".into(),
+            title: "Overwatch Heroes".into(),
+            priority: 70,
+            activation: CorpusActivation::OnEvidence,
+            triggers: vec![term_from_values(&[("zh", "守望先锋"), ("en", "Overwatch")])],
+            trigger_aliases: Vec::new(),
+            activation_context: Vec::new(),
+            terms,
+        };
+        let mut context = PromptContextManager::new(
+            config(),
+            CorpusCatalog::from_definitions(vec![definition]).unwrap(),
+        )
+        .unwrap();
+        let snapshot = context
+            .select("auto", "zh,en", &["Overwatch"], (1_000, 256))
+            .unwrap();
+
+        let prompt = snapshot
+            .translation_prompt_for("I played Reinhardt.")
+            .unwrap();
+        assert!(prompt.contains("莱因哈特,Reinhardt"));
+        let matches = snapshot.translation_term_matches(
+            "I played Reinhardt.",
+            "我玩莱因哈特。",
+            "zh",
+        );
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].text, "莱因哈特");
+        assert!(
+            snapshot
+                .translation_term_matches(
+                    "Long Placeholder Term 39",
+                    "很长的占位术语39",
+                    "zh",
+                )
+                .is_empty()
+        );
     }
 
     #[test]

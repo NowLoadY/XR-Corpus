@@ -15,7 +15,6 @@ zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl
 
 VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat,VRChat
 VRC,VRC,VRC,VRC,VRC,VRC,VRC,VRC,VRC,VRC,VRC,VRC,VRC,VRC,VRC,VRC
-Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi
 FBT,FBT,FBT,FBT,FBT,FBT,FBT,FBT,FBT,FBT,FBT,FBT,FBT,FBT,FBT,FBT
 Questie,Questie,Questie,Questie,Questie,Questie,Questie,Questie,Questie,Questie,Questie,Questie,Questie,Questie,Questie,Questie
 
@@ -32,19 +31,12 @@ Deskie,Deskie,Deskie,Deskie,Deskie,Deskie,Deskie,Deskie,Deskie,Deskie,Deskie,Des
 绿灯,on green,,,,グリーンステータス,,초록색 상태,,,,,,,,
 橙灯,on orange,,,,オレンジステータス,,주황색 상태,,,,,,,,
 红灯,on red,,,,レッドステータス,,빨간색 상태,,,,,,,,
-跳世界,world hopping,,,,ワールドホッピング,,월드 호핑,,,,,,,,
 传送门,portal,,,,ポータル,,포털,,,,,,,,
 盗模,ripping,,,,リッピング,,리핑,,,,,,,,
-VRC 币,V-Bucks,,,,V-Bucks,,V-Bucks,,,,,,,,
 
 ## Terms
 
-Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi,Avi
-Avatar Base,Avatar Base,Avatar Base,Avatar Base,Avatar Base,Avatar Base,Avatar Base,Avatar Base,Avatar Base,Avatar Base,Avatar Base,Avatar Base,Avatar Base,Avatar Base,Avatar Base,Avatar Base
-Big Menu,Big Menu,Big Menu,Big Menu,Big Menu,Big Menu,Big Menu,Big Menu,Big Menu,Big Menu,Big Menu,Big Menu,Big Menu,Big Menu,Big Menu,Big Menu
-Circle Menu,Circle Menu,Circle Menu,Circle Menu,Circle Menu,Circle Menu,Circle Menu,Circle Menu,Circle Menu,Circle Menu,Circle Menu,Circle Menu,Circle Menu,Circle Menu,Circle Menu,Circle Menu
 Deskie,Deskie,Deskie,Deskie,Deskie,Deskie,Deskie,Deskie,Deskie,Deskie,Deskie,Deskie,Deskie,Deskie,Deskie,Deskie
-全身追踪,full-body tracking,,,,フルボディトラッキング,,풀 바디 트래킹,,,,,,,,
 FBT,FBT,FBT,FBT,FBT,FBT,FBT,FBT,FBT,FBT,FBT,FBT,FBT,FBT,FBT,FBT
 面部追踪,face tracking,,,,フェイストラッキング,,페이스 트래킹,,,,,,,,
 FT,FT,FT,FT,FT,FT,FT,FT,FT,FT,FT,FT,FT,FT,FT,FT
@@ -55,17 +47,12 @@ Questie,Questie,Questie,Questie,Questie,Questie,Questie,Questie,Questie,Questie,
 橙灯,on orange,,,,オレンジステータス,,주황색 상태,,,,,,,,
 红灯,on red,,,,レッドステータス,,빨간색 상태,,,,,,,,
 邀我,inv me,,,,inv me,,inv me,,,,,,,,
-向我请求邀请,req off me,,,,req off me,,req off me,,,,,,,,
-世界跳跃,world hopping,,,,ワールドホッピング,,월드 호핑,,,,,,,,
 丢传送门,drop a portal,,,,ポータルを出す,,포털 열기,,,,,,,,
-麻花状态,pretzel,,,,プレッツェル,,프레첼,,,,,,,,
 换皮,retexture,,,,リテクスチャ,,리텍스처,,,,,,,,
 Avatar 盗取,avatar ripping,,,,アバターリッピング,,아바타 리핑,,,,,,,,
-崩溃 Avatar,crasher avatar,,,,クラッシャーアバター,,크래셔 아바타,,,,,,,,
 男娘,femboy,,,,フェムボーイ,,펨보이,,,,,,,,
 摸摸,headpat,,,,なでなで,,쓰담쓰담,,,,,,,,
 贴贴,cuddle,,,,くっつく,,꼭 붙기,,,,,,,,
-VRC 币,V-Bucks,,,,V-Bucks,,V-Bucks,,,,,,,,
 
 ## Scope
 
