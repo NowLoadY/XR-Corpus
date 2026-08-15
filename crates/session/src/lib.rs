@@ -619,12 +619,14 @@ impl PromptContextManager {
         // history entries. Confirmed active state is retained separately.
         let mut activation_evidence = current_evidence.clone();
         let snapshot = self.catalog.snapshot()?;
-        // Runtime `Always` corpora provide mode evidence. Runtime-only corpora
-        // remain prompt data, but they do not activate static specialist
-        // glossaries by themselves.
+        // Runtime `Always` corpora provide mode evidence. Static `Always` corpora
+        // (such as default platform entries) provide candidate vocabulary terms
+        // without falsely claiming the user is currently speaking in that mode.
+        // Runtime-only corpora remain prompt data, but do not activate static
+        // specialist glossaries by themselves.
         for corpus in snapshot
             .iter()
-            .filter(|corpus| corpus.activation == CorpusActivation::Always)
+            .filter(|corpus| corpus.activation == CorpusActivation::Always && corpus.id.contains("runtime"))
         {
             for term in &corpus.terms {
                 for value in languages.iter().filter_map(|language| term.value(language)) {
@@ -2617,4 +2619,50 @@ mod tests {
         assert_eq!(context_matches.len(), 1);
         assert_eq!(context_matches[0].text, "Lucio");
     }
+
+    #[test]
+    fn checked_in_catalog_does_not_activate_vrchat_community_language_without_evidence_or_runtime() {
+        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
+        let mut context = PromptContextManager::new(config(), catalog.clone()).unwrap();
+
+        // 1. Unrelated speech when VRChat is not running: VRChat community language is NOT active.
+        let snapshot = context
+            .select("auto", "zh,en", &["Hello, how are you today?"], (1_000, 1_000))
+            .unwrap();
+        let prompt = snapshot.translation_prompt();
+        if let Some(prompt_text) = prompt {
+            assert!(!prompt_text.contains("男娘,femboy"), "VRChat community language should not activate on unrelated speech");
+            assert!(!prompt_text.contains("面部追踪,face tracking"), "face tracking should not activate on unrelated speech");
+        }
+        // Entry platform term VRChat is not active on unrelated speech when not running VRChat.
+        let asr = snapshot.asr_prompt();
+        if let Some(asr_text) = asr {
+            assert!(!asr_text.contains("VRChat"));
+        }
+
+        // 2. When VRCX publishes runtime game mode (VRChat running): community language (like 男娘) IS active by default.
+        catalog
+            .dynamic_source()
+            .replace_snapshot(
+                "vrcx",
+                vec![corpus(
+                    "virtual-worlds.vrchat.runtime-game-mode",
+                    1_100,
+                    CorpusActivation::Always,
+                    &[],
+                    &[("VRChat", "VRChat")],
+                )],
+                None,
+            )
+            .unwrap();
+        let mut running_context = PromptContextManager::new(config(), catalog).unwrap();
+        let running_snapshot = running_context
+            .select("auto", "zh,en", &["Hello, how are you today?"], (1_000, 1_000))
+            .unwrap();
+        let running_prompt = running_snapshot.translation_prompt().unwrap();
+        assert!(running_prompt.contains("男娘,femboy"), "VRChat running mode should activate community language by default");
+        assert!(running_prompt.contains("摸摸,headpat"), "VRChat running mode should activate community language by default");
+    }
 }
+
