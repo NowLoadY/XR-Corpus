@@ -89,6 +89,9 @@ pub struct PrepareTranslationRequest {
     /// same utterance reuse this value so topic decay advances only once.
     #[serde(default)]
     pub turn_id: Option<String>,
+    /// Neutral speaker identity assigned by recognition infrastructure.
+    #[serde(default)]
+    pub speaker_id: String,
     pub source_language: String,
     pub target_language: String,
     pub recognized_text: String,
@@ -120,6 +123,13 @@ pub struct PrepareTranslationResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecordTranslationRequest {
     pub context_id: u64,
+    /// Stable logical speech-turn identity. Repeated IDs update the latest
+    /// continuous recognition revision instead of appending overlap as a new
+    /// dialogue turn.
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub speaker_id: String,
     pub source_language: String,
     pub target_language: String,
     pub source_text: String,
@@ -175,4 +185,26 @@ pub struct VrcxStatusResponse {
     pub term_count: usize,
     pub age_ms: Option<u64>,
     pub last_error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logical_turn_metadata_is_backward_compatible() {
+        let request: RecordTranslationRequest = serde_json::from_str(
+            r#"{"context_id":1,"source_language":"en","target_language":"zh","source_text":"hello","translated_text":"你好"}"#,
+        )
+        .unwrap();
+        assert_eq!(request.turn_id, None);
+        assert!(request.speaker_id.is_empty());
+
+        let request: PrepareTranslationRequest = serde_json::from_str(
+            r#"{"asr_context_id":1,"source_language":"en","target_language":"zh","recognized_text":"hello","segments":["hello"],"budgets":{"asr_tokens":64,"translation_tokens":128}}"#,
+        )
+        .unwrap();
+        assert_eq!(request.turn_id, None);
+        assert!(request.speaker_id.is_empty());
+    }
 }

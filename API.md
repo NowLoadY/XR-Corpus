@@ -29,9 +29,11 @@ Do not branch on the English `error` text.
 1. `POST /v1/sessions` with `{}`.
 2. Before ASR, `POST /v1/sessions/{id}/asr` with languages and model-derived token budgets.
 3. After ASR, `POST /v1/sessions/{id}/translation` with the recognition and its segments.
-4. Translate each returned segment using its `prompt` and shared `context_id`.
-5. In source order, `POST /v1/sessions/{id}/results`. This records bounded bilingual history and
-   returns authoritative terminology provenance spans.
+4. Translate each returned segment using its immutable `prompt` and shared `context_id`.
+5. Join the successful segments in source order and `POST /v1/sessions/{id}/results` once for the
+   logical speech turn. Send the same `turn_id` on continuous-window revisions; the latest window
+   updates that turn instead of appending overlapping text. `speaker_id` is optional neutral
+   recognition metadata used to label dialogue context.
 6. `DELETE /v1/sessions/{id}` when finished. Abandoned sessions expire automatically.
 
 `GET /v1/sessions/{id}` exposes active corpus IDs and retained snapshot count for diagnostics.

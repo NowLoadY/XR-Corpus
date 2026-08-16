@@ -30,7 +30,7 @@ use xr_corpus_protocol::{
     PrepareTranslationResponse, ProviderSnapshotResponse, PublishProviderRequest,
     RecordTranslationRequest, RecordTranslationResponse, SegmentContext, SessionStateResponse,
 };
-use xr_corpus_session::{PromptContextManager, PromptContextSnapshot};
+use xr_corpus_session::{CurrentTurnContext, PromptContextManager, PromptContextSnapshot};
 
 mod vrcx;
 
@@ -319,16 +319,24 @@ async fn prepare_translation(
     );
     let snapshot = session
         .manager
-        .select_observation(
+        .select_turn_observation(
             &request.source_language,
             &request.target_language,
             &[request.recognized_text.as_str()],
             budgets(request.budgets),
             advance_topic,
+            CurrentTurnContext {
+                turn_id: request.turn_id.as_deref(),
+                speaker_id: &request.speaker_id,
+                source_text: (request.segments.len() > 1)
+                    .then_some(request.recognized_text.as_str()),
+            },
         )
         .map_err(internal_error)?;
     let source_corrections = snapshot.recognition_corrections(&request.recognized_text);
-    session.manager.record_transcript(&request.recognized_text);
+    session
+        .manager
+        .record_transcript_turn(request.turn_id.as_deref(), &request.recognized_text);
     let segments = request
         .segments
         .iter()
@@ -376,7 +384,9 @@ async fn record_translation(
         &request.translated_text,
         &request.target_language,
     );
-    session.manager.record_translation(
+    session.manager.record_translation_turn(
+        request.turn_id.as_deref(),
+        &request.speaker_id,
         &request.source_language,
         &request.target_language,
         &request.source_text,

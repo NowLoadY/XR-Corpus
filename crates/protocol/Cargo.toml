@@ -9,3 +9,6 @@ description = "Stable HTTP protocol shared by XR Corpus servers and clients."
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 xr-corpus-core = { path = "../core" }
+
+[dev-dependencies]
+serde_json = "1.0.151"
