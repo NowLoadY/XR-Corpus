@@ -343,8 +343,8 @@ async fn prepare_translation(
         .map(|text| {
             let source_corrections = snapshot.recognition_corrections(text);
             SegmentContext {
-                prompt: snapshot.translation_prompt_for(&text),
                 prompt_terms: snapshot.translation_prompt_terms_for(&text),
+                context_data: snapshot.translation_context_data_for(text),
                 source_corrections,
                 activation_matches: snapshot.activation_matches(&text),
                 context_matches: snapshot.recognition_context_matches(&text),

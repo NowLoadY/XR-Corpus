@@ -29,7 +29,11 @@ Do not branch on the English `error` text.
 1. `POST /v1/sessions` with `{}`.
 2. Before ASR, `POST /v1/sessions/{id}/asr` with languages and model-derived token budgets.
 3. After ASR, `POST /v1/sessions/{id}/translation` with the recognition and its segments.
-4. Translate each returned segment using its immutable `prompt` and shared `context_id`.
+4. Translate each returned segment using its structured `context_data`, `prompt_terms`, and
+   shared `context_id`. `context_data` exposes bounded recent turns, the previous streaming
+   revision, and source text surrounding that exact segment. `prompt_terms` supplies relevant
+   structured terminology. These fields are data only; XR Corpus does not own user templates,
+   block ordering, or provider message roles.
 5. Join the successful segments in source order and `POST /v1/sessions/{id}/results` once for the
    logical speech turn. Send the same `turn_id` on continuous-window revisions; the latest window
    updates that turn instead of appending overlapping text. `speaker_id` is optional neutral
@@ -83,6 +87,6 @@ remain empty columns. The Rust types validate schema IDs, column count, limits, 
 - The service binds to loopback only.
 - Provider replacement is atomic.
 - Dynamic provider data expires by TTL.
-- Session history and prompt snapshots are bounded.
+- Session history and context snapshots are bounded.
 - Prompt budgets come from the active ASR and translation models, not hard-coded model names.
 - Static Markdown and dynamic providers enter the same ranking and activation pipeline.

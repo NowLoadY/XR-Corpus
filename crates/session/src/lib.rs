@@ -16,7 +16,8 @@ use xr_corpus_core::{
     CorpusDefinition, CorpusTerm, language_index,
 };
 use xr_corpus_protocol::{
-    CorpusPromptTerm, CorpusRecognitionCorrection, CorpusTermMatch, CorpusTermSource,
+    BilingualContextTurn, CorpusPromptTerm, CorpusRecognitionCorrection, CorpusTermMatch,
+    CorpusTermSource, SurroundingSourceContext, TranslationContextData,
 };
 
 use dialogue::{BilingualTurn, DialogueHistory, TranscriptHistory};
@@ -50,7 +51,6 @@ pub struct PromptContextSnapshot {
     corpora: Vec<SelectedCorpus>,
     asr_prompt: Option<String>,
     asr_echo_guard: Vec<String>,
-    translation_prompt: Option<String>,
     translation_terms: Vec<SelectedPromptTerm>,
     translation_history: Vec<BilingualTurn>,
     current_source_context: Option<CurrentSourceContext>,
@@ -71,14 +71,30 @@ impl PromptContextSnapshot {
         &self.asr_echo_guard
     }
 
-    pub fn translation_prompt(&self) -> Option<String> {
-        self.translation_prompt.clone()
+    #[cfg(test)]
+    fn translation_prompt(&self) -> Option<String> {
+        let rows = self
+            .translation_terms
+            .iter()
+            .map(|term| term.row.clone())
+            .collect::<Vec<_>>();
+        let turns = self.translation_history.iter().collect::<Vec<_>>();
+        (!rows.is_empty() || !turns.is_empty() || self.current_source_context.is_some()).then(
+            || {
+                render_translation_prompt(
+                    &self.languages,
+                    &rows,
+                    &turns,
+                    self.current_source_context.as_ref(),
+                    self.current_turn_id.as_deref(),
+                    None,
+                )
+            },
+        )
     }
 
-    /// Renders a per-segment prompt containing only terminology that occurs in
-    /// the current source. Keeping the rest of an active domain out of the MT
-    /// request prevents a large glossary from being copied as the answer.
-    pub fn translation_prompt_for(&self, source_text: &str) -> Option<String> {
+    #[cfg(test)]
+    fn translation_prompt_for(&self, source_text: &str) -> Option<String> {
         let rows = self
             .relevant_translation_terms(source_text)
             .iter()
@@ -93,9 +109,40 @@ impl PromptContextSnapshot {
                     &turns,
                     self.current_source_context.as_ref(),
                     self.current_turn_id.as_deref(),
+                    Some(source_text),
                 )
             },
         )
+    }
+
+    /// Returns bounded conversation facts for the shared translation composer.
+    pub fn translation_context_data_for(&self, source_text: &str) -> TranslationContextData {
+        let current_turn_id = self.current_turn_id.as_deref();
+        let recent_turns = self
+            .translation_history
+            .iter()
+            .filter(|turn| {
+                current_turn_id.is_none_or(|turn_id| turn.turn_id.as_deref() != Some(turn_id))
+            })
+            .map(context_turn)
+            .collect();
+        let previous_revision = current_turn_id
+            .and_then(|turn_id| {
+                self.translation_history
+                    .iter()
+                    .find(|turn| turn.turn_id.as_deref() == Some(turn_id))
+            })
+            .map(context_turn);
+        let surrounding_source = self
+            .current_source_context
+            .as_ref()
+            .and_then(|current| surrounding_source_context(current, source_text));
+
+        TranslationContextData {
+            recent_turns,
+            previous_revision,
+            surrounding_source,
+        }
     }
 
     /// Returns terminology directly relevant to this source window and
@@ -204,7 +251,7 @@ impl PromptContextSnapshot {
                 .map(|term| term.row.clone())
                 .collect::<Vec<_>>();
             (
-                render_translation_prompt(&self.languages, &rows, &[], None, None),
+                render_translation_prompt(&self.languages, &rows, &[], None, None, None),
                 rows.len(),
             )
         })
@@ -595,7 +642,7 @@ impl PromptContextManager {
             &turns,
             self.config.asr_history_entries,
         );
-        let (translation_prompt, translation_terms, translation_history) = build_translation_prompt(
+        let (translation_terms, translation_history) = select_translation_context(
             &languages,
             &translation_candidates,
             &turns,
@@ -610,7 +657,6 @@ impl PromptContextManager {
             corpora,
             asr_prompt: build_asr_prompt(&terms, self.config.asr_max_chars, token_budgets.0),
             asr_echo_guard,
-            translation_prompt,
             translation_terms,
             translation_history,
             current_source_context,
@@ -1202,7 +1248,7 @@ fn build_asr_echo_guard(
     guard
 }
 
-fn build_translation_prompt(
+fn select_translation_context(
     languages: &[String],
     terms: &[SelectedPromptTerm],
     turns: &[&BilingualTurn],
@@ -1211,7 +1257,7 @@ fn build_translation_prompt(
     token_budget: usize,
     current_source: Option<&CurrentSourceContext>,
     current_turn_id: Option<&str>,
-) -> (Option<String>, Vec<SelectedPromptTerm>, Vec<BilingualTurn>) {
+) -> (Vec<SelectedPromptTerm>, Vec<BilingualTurn>) {
     let useful_terms = terms
         .iter()
         .filter(|term| {
@@ -1239,7 +1285,7 @@ fn build_translation_prompt(
             .map(|term| term.row.clone())
             .collect::<Vec<_>>();
         let candidate =
-            render_translation_prompt(languages, &rows, &[], current_source, current_turn_id);
+            render_translation_prompt(languages, &rows, &[], current_source, current_turn_id, None);
         if candidate.chars().count() > term_budget
             || estimated_prompt_tokens(&candidate) > token_budget * 3 / 5
         {
@@ -1262,6 +1308,7 @@ fn build_translation_prompt(
             &candidate_turns,
             current_source,
             current_turn_id,
+            None,
         );
         if !within_prompt_budget(&candidate, budget, token_budget) {
             continue;
@@ -1278,22 +1325,22 @@ fn build_translation_prompt(
         &selected_turns,
         current_source,
         current_turn_id,
+        None,
     );
-    let prompt =
+    let prompt_is_within_budget =
         (!selected_terms.is_empty() || !selected_turns.is_empty() || current_source.is_some())
-            .then_some(prompt)
-            .filter(|prompt| within_prompt_budget(prompt, budget, token_budget));
-    let admitted_terms = if prompt.is_some() {
+            && within_prompt_budget(&prompt, budget, token_budget);
+    let admitted_terms = if prompt_is_within_budget {
         selected_terms
     } else {
         Vec::new()
     };
-    let admitted_history = if prompt.is_some() {
+    let admitted_history = if prompt_is_within_budget {
         selected_turns.into_iter().cloned().collect()
     } else {
         Vec::new()
     };
-    (prompt, admitted_terms, admitted_history)
+    (admitted_terms, admitted_history)
 }
 
 fn term_spans(text: &str, term: &str) -> Vec<(usize, usize)> {
@@ -1520,6 +1567,7 @@ fn render_translation_prompt(
     turns: &[&BilingualTurn],
     current_source: Option<&CurrentSourceContext>,
     current_turn_id: Option<&str>,
+    current_input: Option<&str>,
 ) -> String {
     let mut prompt = format!(
         "# Translation Context\n\n## Language Order\n\n{}",
@@ -1527,7 +1575,7 @@ fn render_translation_prompt(
     );
     append_terms(&mut prompt, terms);
     append_dialogue(&mut prompt, turns, current_turn_id);
-    append_current_source(&mut prompt, current_source);
+    append_current_source(&mut prompt, current_source, current_input);
     prompt
 }
 
@@ -1583,18 +1631,77 @@ fn append_dialogue_turn(prompt: &mut String, turn: &BilingualTurn) {
     prompt.push_str(&turn.translated_text);
 }
 
-fn append_current_source(prompt: &mut String, current: Option<&CurrentSourceContext>) {
+fn append_current_source(
+    prompt: &mut String,
+    current: Option<&CurrentSourceContext>,
+    current_input: Option<&str>,
+) {
     let Some(current) = current else {
         return;
     };
-    prompt.push_str("\n\n## Current Utterance Source\n\n");
-    if !current.speaker_id.is_empty() {
-        prompt.push_str(&current.speaker_id);
-        prompt.push(' ');
+
+    // A complete multi-segment utterance is useful disambiguating context,
+    // but repeating the segment itself here makes small MT models translate
+    // the context as well as the actual input. Remove the exact segment from
+    // the context and retain only its surrounding source text.
+    let label = |prompt: &mut String, name: &str, text: &str| {
+        if text.is_empty() {
+            return;
+        }
+        prompt.push_str(name);
+        prompt.push_str(": ");
+        if !current.speaker_id.is_empty() {
+            prompt.push_str(&current.speaker_id);
+            prompt.push(' ');
+        }
+        prompt.push_str(&current.source_language);
+        prompt.push_str(" / ");
+        prompt.push_str(text);
+        prompt.push('\n');
+    };
+    if let Some(input) = current_input {
+        // A terminology correction may make the segment differ from the
+        // original recognized text. In that case, omit the unsplittable
+        // context rather than risk translating it as part of the answer.
+        let Some(context) = surrounding_source_context(current, input) else {
+            return;
+        };
+        prompt.push_str("\n\n## Current Utterance Context (context only; do not translate)\n\n");
+        label(prompt, "Before current input", &context.before);
+        label(prompt, "After current input", &context.after);
+    } else {
+        prompt.push_str("\n\n## Current Utterance Context (context only; do not translate)\n\n");
+        label(prompt, "Current utterance", current.source_text.trim());
     }
-    prompt.push_str(&current.source_language);
-    prompt.push_str(": ");
-    prompt.push_str(&current.source_text);
+}
+
+fn context_turn(turn: &BilingualTurn) -> BilingualContextTurn {
+    BilingualContextTurn {
+        turn_id: turn.turn_id.clone(),
+        speaker_id: turn.speaker_id.clone(),
+        source_language: turn.source_language.clone(),
+        target_language: turn.target_language.clone(),
+        source_text: turn.source_text.clone(),
+        translated_text: turn.translated_text.clone(),
+    }
+}
+
+fn surrounding_source_context(
+    current: &CurrentSourceContext,
+    current_input: &str,
+) -> Option<SurroundingSourceContext> {
+    let input = current_input.trim();
+    if input.is_empty() {
+        return None;
+    }
+    let start = current.source_text.find(input)?;
+    let end = start + input.len();
+    Some(SurroundingSourceContext {
+        speaker_id: current.speaker_id.clone(),
+        source_language: current.source_language.clone(),
+        before: current.source_text[..start].trim().to_owned(),
+        after: current.source_text[end..].trim().to_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -1814,9 +1921,54 @@ mod tests {
 
         let prompt = snapshot.translation_prompt_for("Tell the team.").unwrap();
         assert!(prompt.contains("## Recent Bilingual History"));
-        assert!(prompt.contains("## Current Utterance Source"));
-        assert!(prompt.contains("speaker-01 en: If it slips, move it to Friday. Tell the team."));
+        assert!(prompt.contains("## Current Utterance Context (context only; do not translate)"));
+        assert!(
+            prompt
+                .contains("Before current input: speaker-01 en / If it slips, move it to Friday.")
+        );
+        assert!(!prompt.contains("Tell the team."));
         assert!(estimated_prompt_tokens(&prompt) <= 256);
+
+        let data = snapshot.translation_context_data_for("Tell the team.");
+        assert_eq!(data.recent_turns.len(), 1);
+        assert_eq!(
+            data.recent_turns[0].translated_text,
+            "我们刚才在讨论发布计划。"
+        );
+        let surrounding = data.surrounding_source.unwrap();
+        assert_eq!(surrounding.before, "If it slips, move it to Friday.");
+        assert!(surrounding.after.is_empty());
+        assert!(data.previous_revision.is_none());
+    }
+
+    #[test]
+    fn unmatched_corrected_segment_does_not_reintroduce_full_utterance_context() {
+        let mut context = PromptContextManager::new(config(), catalog()).unwrap();
+        let snapshot = context
+            .select_turn_observation(
+                "en",
+                "zh",
+                &["Like coffee is good too, but it does not wake you up."],
+                (1_000, 256),
+                true,
+                CurrentTurnContext {
+                    turn_id: Some("current"),
+                    speaker_id: "speaker-01",
+                    source_text: Some("Like coffee is good too, but it does not wake you up."),
+                },
+            )
+            .unwrap();
+
+        let prompt = snapshot
+            .translation_prompt_for("Like coffee is good too, [corrected]")
+            .unwrap();
+        assert!(!prompt.contains("Like coffee is good too, but it does not wake you up."));
+        assert!(
+            snapshot
+                .translation_context_data_for("Like coffee is good too, [corrected]")
+                .surrounding_source
+                .is_none()
+        );
     }
 
     #[test]
@@ -1851,6 +2003,12 @@ mod tests {
         assert!(prompt.contains("## Previous Revision of Current Speech"));
         assert!(!prompt.contains("## Recent Bilingual History"));
         assert!(prompt.contains("speaker-01 en: The first sliding window."));
+        let data = snapshot.translation_context_data_for("The sliding window continues.");
+        assert!(data.recent_turns.is_empty());
+        assert_eq!(
+            data.previous_revision.unwrap().source_text,
+            "The first sliding window."
+        );
     }
 
     #[test]

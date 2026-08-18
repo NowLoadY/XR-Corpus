@@ -102,13 +102,55 @@ pub struct PrepareTranslationRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SegmentContext {
     pub corrected_text: String,
-    pub prompt: Option<String>,
     #[serde(default)]
     pub prompt_terms: Vec<CorpusPromptTerm>,
+    /// Neutral, already-bounded conversation facts. Callers may use these to
+    /// compose a model prompt without depending on XR Corpus's default text
+    /// rendering or internal session types.
+    #[serde(default)]
+    pub context_data: TranslationContextData,
     #[serde(default)]
     pub source_corrections: Vec<CorpusRecognitionCorrection>,
     pub activation_matches: Vec<CorpusTermMatch>,
     pub context_matches: Vec<CorpusTermMatch>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranslationContextData {
+    /// Completed earlier logical turns, oldest first and bounded by the
+    /// session's configured history and model budget.
+    #[serde(default)]
+    pub recent_turns: Vec<BilingualContextTurn>,
+    /// The preceding overlapping window for the same logical speech turn.
+    #[serde(default)]
+    pub previous_revision: Option<BilingualContextTurn>,
+    /// Source text surrounding this exact translation segment. The segment
+    /// itself is intentionally absent so it cannot be translated twice.
+    #[serde(default)]
+    pub surrounding_source: Option<SurroundingSourceContext>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BilingualContextTurn {
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub speaker_id: String,
+    pub source_language: String,
+    pub target_language: String,
+    pub source_text: String,
+    pub translated_text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurroundingSourceContext {
+    #[serde(default)]
+    pub speaker_id: String,
+    pub source_language: String,
+    #[serde(default)]
+    pub before: String,
+    #[serde(default)]
+    pub after: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -206,5 +248,48 @@ mod tests {
         .unwrap();
         assert_eq!(request.turn_id, None);
         assert!(request.speaker_id.is_empty());
+    }
+
+    #[test]
+    fn structured_translation_context_is_serialized_for_translation() {
+        let segment: SegmentContext = serde_json::from_str(
+            r#"{"corrected_text":"hello","activation_matches":[],"context_matches":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(segment.context_data, TranslationContextData::default());
+
+        let encoded = serde_json::to_value(SegmentContext {
+            corrected_text: "Tell the team.".into(),
+            prompt_terms: Vec::new(),
+            context_data: TranslationContextData {
+                recent_turns: vec![BilingualContextTurn {
+                    turn_id: Some("previous".into()),
+                    speaker_id: "speaker-01".into(),
+                    source_language: "en".into(),
+                    target_language: "zh".into(),
+                    source_text: "The plan changed.".into(),
+                    translated_text: "计划变了。".into(),
+                }],
+                previous_revision: None,
+                surrounding_source: Some(SurroundingSourceContext {
+                    speaker_id: "speaker-01".into(),
+                    source_language: "en".into(),
+                    before: "If it slips, move it to Friday.".into(),
+                    after: String::new(),
+                }),
+            },
+            source_corrections: Vec::new(),
+            activation_matches: Vec::new(),
+            context_matches: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            encoded["context_data"]["recent_turns"][0]["turn_id"],
+            "previous"
+        );
+        assert_eq!(
+            encoded["context_data"]["surrounding_source"]["before"],
+            "If it slips, move it to Friday."
+        );
     }
 }

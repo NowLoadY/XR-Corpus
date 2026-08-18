@@ -7,9 +7,10 @@ keeps bounded bilingual conversation history, and exposes stable HTTP and Rust c
 ## Design
 
 - Markdown remains the source of truth for static corpora.
-- Activation state and prompt snapshots belong to a server-side session.
+- Activation state and context snapshots belong to a server-side session.
 - Static corpora and short-lived runtime providers use one catalog contract.
-- Callers receive rendered prompts and provenance spans, not internal catalog objects.
+- Callers receive stable, neutral context data and provenance spans, not
+  rendered translation prompts or internal catalog/UI template objects.
 - Idle sessions, snapshots, and dynamic data are bounded and expire automatically.
 
 ## Run
