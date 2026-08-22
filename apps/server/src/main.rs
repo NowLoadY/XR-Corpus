@@ -487,14 +487,28 @@ fn lock_error<T>(error: std::sync::PoisonError<T>) -> (StatusCode, Json<ErrorRes
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => info!("shutdown signal received"),
+            Err(error) => {
+                warn!(%error, "Ctrl+C listener is unavailable; keeping XR Corpus running");
+                std::future::pending::<()>().await;
+            }
+        }
     };
     #[cfg(unix)]
     let terminate = async {
-        if let Ok(mut signal) =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            signal.recv().await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => match signal.recv().await {
+                Some(()) => info!("termination signal received"),
+                None => {
+                    warn!("termination signal stream closed; keeping XR Corpus running");
+                    std::future::pending::<()>().await;
+                }
+            },
+            Err(error) => {
+                warn!(%error, "termination signal listener is unavailable; keeping XR Corpus running");
+                std::future::pending::<()>().await;
+            }
         }
     };
     #[cfg(not(unix))]
