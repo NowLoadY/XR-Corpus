@@ -49,6 +49,7 @@ pub struct CurrentTurnContext<'a> {
 pub struct PromptContextSnapshot {
     languages: Vec<String>,
     corpora: Vec<SelectedCorpus>,
+    asr_vocabulary: Vec<String>,
     asr_prompt: Option<String>,
     asr_echo_guard: Vec<String>,
     translation_terms: Vec<SelectedPromptTerm>,
@@ -60,6 +61,10 @@ pub struct PromptContextSnapshot {
 }
 
 impl PromptContextSnapshot {
+    pub fn asr_vocabulary(&self) -> &[String] {
+        &self.asr_vocabulary
+    }
+
     pub fn asr_prompt(&self) -> Option<String> {
         self.asr_prompt.clone()
     }
@@ -652,10 +657,13 @@ impl PromptContextManager {
             current_source_context.as_ref(),
             current_turn_id.as_deref(),
         );
+        let asr_vocabulary =
+            build_asr_vocabulary(&terms, self.config.asr_max_chars, token_budgets.0);
         Ok(PromptContextSnapshot {
             languages,
             corpora,
-            asr_prompt: build_asr_prompt(&terms, self.config.asr_max_chars, token_budgets.0),
+            asr_prompt: (!asr_vocabulary.is_empty()).then(|| render_asr_prompt(&asr_vocabulary)),
+            asr_vocabulary,
             asr_echo_guard,
             translation_terms,
             translation_history,
@@ -1201,11 +1209,11 @@ fn selected_term_row(term: &CorpusTerm, languages: &[String]) -> String {
         .join(",")
 }
 
-fn build_asr_prompt(
+fn build_asr_vocabulary(
     terms: &[SelectedPromptTerm],
     budget: usize,
     token_budget: usize,
-) -> Option<String> {
+) -> Vec<String> {
     let mut hotwords = Vec::new();
     let mut seen = HashSet::new();
     // Qwen3-ASR officially treats the system prompt as free-form
@@ -1225,7 +1233,7 @@ fn build_asr_prompt(
             }
         }
     }
-    (!hotwords.is_empty()).then(|| render_asr_prompt(&hotwords))
+    hotwords
 }
 
 fn build_asr_echo_guard(
@@ -1792,6 +1800,13 @@ mod tests {
         let translation = snapshot.translation_prompt().unwrap();
         assert!(asr.starts_with("Vocabulary: "));
         assert!(asr.contains("ERes2NetV2"));
+        assert!(
+            snapshot
+                .asr_vocabulary()
+                .iter()
+                .any(|term| term == "ERes2NetV2")
+        );
+        assert!(!snapshot.asr_vocabulary().iter().any(|term| term == "Hello Mercy"));
         assert!(!asr.contains("Hello Mercy"));
         assert!(
             snapshot

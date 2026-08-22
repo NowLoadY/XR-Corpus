@@ -294,6 +294,7 @@ async fn prepare_asr(
     let context_id = insert_snapshot(&mut session, snapshot.clone());
     Ok(Json(PrepareAsrResponse {
         context_id,
+        vocabulary: snapshot.asr_vocabulary().to_vec(),
         prompt: snapshot.asr_prompt(),
         echo_guard: snapshot.asr_echo_guard().to_vec(),
     }))

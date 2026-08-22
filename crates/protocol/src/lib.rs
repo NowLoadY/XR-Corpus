@@ -78,7 +78,15 @@ pub struct PrepareAsrRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrepareAsrResponse {
     pub context_id: u64,
+    /// Structured recognition vocabulary selected for this turn. Consumers
+    /// decide whether to render it as prompt context or deliver it through a
+    /// provider's weighted vocabulary contract.
+    #[serde(default)]
+    pub vocabulary: Vec<String>,
+    /// Legacy pre-rendered ASR context retained for older consumers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    #[serde(default)]
     pub echo_guard: Vec<String>,
 }
 
@@ -248,6 +256,13 @@ mod tests {
         .unwrap();
         assert_eq!(request.turn_id, None);
         assert!(request.speaker_id.is_empty());
+
+        let response: PrepareAsrResponse = serde_json::from_str(
+            r#"{"context_id":1,"prompt":"Vocabulary: VRChat","echo_guard":[]}"#,
+        )
+        .unwrap();
+        assert!(response.vocabulary.is_empty());
+        assert_eq!(response.prompt.as_deref(), Some("Vocabulary: VRChat"));
     }
 
     #[test]
