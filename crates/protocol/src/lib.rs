@@ -5,7 +5,7 @@ pub use xr_corpus_core::{
     CORPUS_LANGUAGE_ORDER, CORPUS_SCHEMA, CorpusActivation, CorpusDefinition, CorpusTerm,
     GraphDomain, GraphEdge, GraphEdgeKind, GraphNode, GraphNodeStatePatch, GraphSnapshot,
 };
-pub const API_VERSION: u16 = 1;
+pub const API_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorpusTermMatch {

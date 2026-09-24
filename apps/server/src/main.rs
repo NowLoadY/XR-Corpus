@@ -151,31 +151,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     spawn_session_reaper(state.clone());
     let app = Router::new()
         .route("/healthz", get(health))
-        .route("/v1/graph", get(graph_snapshot))
+        .route("/v2/graph", get(graph_snapshot))
         .route(
-            "/v1/graph/domains/{id}",
+            "/v2/graph/domains/{id}",
             put(upsert_domain).delete(delete_domain),
         )
-        .route("/v1/graph/nodes", put(patch_node_state))
-        .route("/v1/graph/nodes/{id}", put(upsert_node).delete(delete_node))
-        .route("/v1/graph/edges", put(upsert_edge).delete(delete_edge))
-        .route("/v1/integrations/vrcx/status", get(vrcx::get_status))
+        .route("/v2/graph/nodes", put(patch_node_state))
+        .route("/v2/graph/nodes/{id}", put(upsert_node).delete(delete_node))
+        .route("/v2/graph/edges", put(upsert_edge).delete(delete_edge))
+        .route("/v2/integrations/vrcx/status", get(vrcx::get_status))
         .route(
-            "/v1/providers/{provider_id}",
+            "/v2/providers/{provider_id}",
             put(publish_provider).delete(delete_provider),
         )
-        .route("/v1/sessions", post(create_session))
+        .route("/v2/sessions", post(create_session))
         .route(
-            "/v1/sessions/{session_id}",
+            "/v2/sessions/{session_id}",
             get(session_state).delete(delete_session),
         )
-        .route("/v1/sessions/{session_id}/asr", post(prepare_asr))
+        .route("/v2/sessions/{session_id}/asr", post(prepare_asr))
         .route(
-            "/v1/sessions/{session_id}/translation",
+            "/v2/sessions/{session_id}/translation",
             post(prepare_translation),
         )
         .route(
-            "/v1/sessions/{session_id}/results",
+            "/v2/sessions/{session_id}/results",
             post(record_translation),
         )
         .with_state(state);

@@ -1,16 +1,16 @@
-# XR Corpus API v1
+# XR Corpus API v2
 
 XR Corpus is a loopback HTTP service. The default base URL is `http://127.0.0.1:7766`.
-All JSON endpoints live under `/v1`; readiness is available at `/healthz`.
+All JSON endpoints live under `/v2`; readiness is available at `/healthz`.
 
 ## Compatibility and errors
 
-Call `GET /healthz` before creating sessions and require `api_version: 1`. The Rust SDK does this
+Call `GET /healthz` before creating sessions and require `api_version: 2`. The Rust SDK does this
 with `CorpusClient::connect`.
 
 ```sh
 curl http://127.0.0.1:7766/healthz
-curl -X POST -H "Content-Type: application/json" -d "{}" http://127.0.0.1:7766/v1/sessions
+curl -X POST -H "Content-Type: application/json" -d "{}" http://127.0.0.1:7766/v2/sessions
 ```
 
 Errors have a stable machine-readable code and a human-readable message:
@@ -26,37 +26,37 @@ Do not branch on the English `error` text.
 
 ## Inference session lifecycle
 
-1. `POST /v1/sessions` with `{}`.
-2. Before ASR, `POST /v1/sessions/{id}/asr` with languages and model-derived token budgets.
-3. After ASR, `POST /v1/sessions/{id}/translation` with the recognition and its segments.
+1. `POST /v2/sessions` with `{}`.
+2. Before ASR, `POST /v2/sessions/{id}/asr` with languages and model-derived token budgets.
+3. After ASR, `POST /v2/sessions/{id}/translation` with the recognition and its segments.
 4. Translate each returned segment using its structured `context_data`, `prompt_terms`, and
    shared `context_id`. `context_data` exposes bounded recent turns, the previous streaming
    revision, and source text surrounding that exact segment. `prompt_terms` supplies relevant
    structured terminology. These fields are data only; XR Corpus does not own user templates,
    block ordering, or provider message roles.
-5. Join the successful segments in source order and `POST /v1/sessions/{id}/results` once for the
+5. Join the successful segments in source order and `POST /v2/sessions/{id}/results` once for the
    logical speech turn. Send the same `turn_id` on continuous-window revisions; the latest window
    updates that turn instead of appending overlapping text. `speaker_id` is optional neutral
    recognition metadata used to label dialogue context.
-6. `DELETE /v1/sessions/{id}` when finished. Abandoned sessions expire automatically.
+6. `DELETE /v2/sessions/{id}` when finished. Abandoned sessions expire automatically.
 
-`GET /v1/sessions/{id}` exposes active corpus IDs and retained snapshot count for diagnostics.
+`GET /v2/sessions/{id}` exposes active corpus IDs and retained snapshot count for diagnostics.
 Snapshots are immutable and bounded; clients must not reuse old context IDs indefinitely.
 
 ## Vocabulary graph
 
-`GET /v1/graph` returns the editable persistent graph as `domains`, `nodes`,
+`GET /v2/graph` returns the editable persistent graph as `domains`, `nodes`,
 and `edges`. Node positions are arranged automatically by the client and are
 not stored in the corpus database.
 Changes take effect in new ASR and translation selections without restarting the service.
 
-- `PUT /v1/graph/domains/{id}` saves a domain; `DELETE` removes an empty domain.
-- `PUT /v1/graph/nodes/{id}` saves a node; `DELETE` removes a node but leaves its edges
+- `PUT /v2/graph/domains/{id}` saves a domain; `DELETE` removes an empty domain.
+- `PUT /v2/graph/nodes/{id}` saves a node; `DELETE` removes a node but leaves its edges
   dormant so they can reconnect if that ID appears again.
-- `PUT /v1/graph/nodes` updates `enabled` and/or `domain_id` for a nonempty
+- `PUT /v2/graph/nodes` updates `enabled` and/or `domain_id` for a nonempty
   `ids` array in one transaction. Unknown or duplicate IDs and unknown domains reject
   the entire batch.
-- `PUT /v1/graph/edges` saves an edge; `DELETE /v1/graph/edges` with the edge as JSON
+- `PUT /v2/graph/edges` saves an edge; `DELETE /v2/graph/edges` with the edge as JSON
   removes it.
 
 Mutations return the current complete graph. IDs in URL paths must match the JSON body.
@@ -80,8 +80,8 @@ External programs publish current room names, player names, project terminology,
 short-lived information with:
 
 ```text
-PUT /v1/providers/{provider-id}
-DELETE /v1/providers/{provider-id}
+PUT /v2/providers/{provider-id}
+DELETE /v2/providers/{provider-id}
 ```
 
 Each `PUT` atomically replaces that provider's complete snapshot. Runtime snapshots require a TTL

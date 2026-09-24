@@ -40,7 +40,7 @@ impl std::fmt::Display for CorpusClientError {
             | Self::InvalidResponse(message) => formatter.write_str(message),
             Self::IncompatibleApi { expected, actual } => write!(
                 formatter,
-                "XR Corpus API version {actual} is incompatible; this client requires {expected}"
+                "XR Corpus API version {actual} is incompatible; this client requires {expected}. Stop the older XR Corpus service and retry"
             ),
             Self::Server {
                 status,
@@ -126,7 +126,7 @@ impl CorpusClient {
 
     pub async fn create_session(&self) -> CorpusResult<CorpusSessionClient> {
         let response: CreateSessionResponse = self
-            .post("/v1/sessions", &CreateSessionRequest::default())
+            .post("/v2/sessions", &CreateSessionRequest::default())
             .await?;
         Ok(CorpusSessionClient {
             client: self.clone(),
@@ -135,11 +135,11 @@ impl CorpusClient {
     }
 
     pub async fn vrcx_status(&self) -> CorpusResult<VrcxStatusResponse> {
-        self.get("/v1/integrations/vrcx/status").await
+        self.get("/v2/integrations/vrcx/status").await
     }
 
     pub async fn graph(&self) -> CorpusResult<GraphSnapshot> {
-        self.get("/v1/graph").await
+        self.get("/v2/graph").await
     }
 
     pub async fn save_domain(&self, domain: &GraphDomain) -> CorpusResult<GraphSnapshot> {
@@ -160,7 +160,7 @@ impl CorpusClient {
         &self,
         patch: &GraphNodeStatePatch,
     ) -> CorpusResult<GraphSnapshot> {
-        self.put("/v1/graph/nodes", patch).await
+        self.put("/v2/graph/nodes", patch).await
     }
 
     pub async fn remove_node(&self, id: &str) -> CorpusResult<GraphSnapshot> {
@@ -169,11 +169,11 @@ impl CorpusClient {
     }
 
     pub async fn save_edge(&self, edge: &GraphEdge) -> CorpusResult<GraphSnapshot> {
-        self.put("/v1/graph/edges", edge).await
+        self.put("/v2/graph/edges", edge).await
     }
 
     pub async fn remove_edge(&self, edge: &GraphEdge) -> CorpusResult<GraphSnapshot> {
-        self.delete_graph("/v1/graph/edges", Some(edge)).await
+        self.delete_graph("/v2/graph/edges", Some(edge)).await
     }
 
     pub async fn publish_provider(
@@ -270,7 +270,7 @@ impl CorpusSessionClient {
         request: &PrepareAsrRequest,
     ) -> CorpusResult<PrepareAsrResponse> {
         self.client
-            .post(&format!("/v1/sessions/{}/asr", self.session_id), request)
+            .post(&format!("/v2/sessions/{}/asr", self.session_id), request)
             .await
     }
 
@@ -280,7 +280,7 @@ impl CorpusSessionClient {
     ) -> CorpusResult<PrepareTranslationResponse> {
         self.client
             .post(
-                &format!("/v1/sessions/{}/translation", self.session_id),
+                &format!("/v2/sessions/{}/translation", self.session_id),
                 request,
             )
             .await
@@ -292,7 +292,7 @@ impl CorpusSessionClient {
     ) -> CorpusResult<RecordTranslationResponse> {
         self.client
             .post(
-                &format!("/v1/sessions/{}/results", self.session_id),
+                &format!("/v2/sessions/{}/results", self.session_id),
                 request,
             )
             .await
@@ -300,13 +300,13 @@ impl CorpusSessionClient {
 
     pub async fn state(&self) -> CorpusResult<SessionStateResponse> {
         self.client
-            .get(&format!("/v1/sessions/{}", self.session_id))
+            .get(&format!("/v2/sessions/{}", self.session_id))
             .await
     }
 
     pub async fn close(self) -> CorpusResult<()> {
         self.client
-            .delete(&format!("/v1/sessions/{}", self.session_id))
+            .delete(&format!("/v2/sessions/{}", self.session_id))
             .await
     }
 }
@@ -386,11 +386,11 @@ fn provider_path(provider_id: &str) -> CorpusResult<String> {
             "provider ID must contain only lowercase ASCII letters, digits, and hyphens".into(),
         ));
     }
-    Ok(format!("/v1/providers/{provider_id}"))
+    Ok(format!("/v2/providers/{provider_id}"))
 }
 
 fn graph_item_path(kind: &str, id: &str) -> String {
-    let mut url = reqwest::Url::parse("http://localhost/v1/graph").expect("fixed graph URL");
+    let mut url = reqwest::Url::parse("http://localhost/v2/graph").expect("fixed graph URL");
     url.path_segments_mut()
         .expect("graph URL supports path segments")
         .extend([kind, id]);
@@ -407,7 +407,7 @@ mod tests {
         assert!(CorpusClient::new("http://[::1]:7766").is_ok());
         assert!(CorpusClient::new("https://corpus.example").is_err());
         assert!(CorpusClient::new("ws://127.0.0.1:7766").is_err());
-        assert!(CorpusClient::new("http://127.0.0.1:7766/v1").is_err());
+        assert!(CorpusClient::new("http://127.0.0.1:7766/v2").is_err());
         assert!(CorpusClient::new("not a url").is_err());
         assert!(provider_path("my-game").is_ok());
         assert!(provider_path("../other").is_err());
