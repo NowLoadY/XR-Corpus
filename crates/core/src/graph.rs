@@ -12,7 +12,7 @@ use std::{
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-use crate::{CORPUS_SCHEMA, CorpusActivation, CorpusDefinition, CorpusTerm};
+use crate::{CORPUS_SCHEMA, CorpusActivation, CorpusDefinition, CorpusTerm, VRCX_DOMAIN_ID};
 
 const DATABASE_VERSION: i64 = 3;
 static NEXT_SEED_FILE: AtomicU64 = AtomicU64::new(1);
@@ -154,6 +154,13 @@ impl GraphStore {
             .map_err(|error| format!("cannot enable database foreign keys: {error}"))?;
         migrate_database(&mut database)?;
         check_database(&database)?;
+        database
+            .execute(
+                "INSERT INTO domains (id,title,enabled) VALUES (?1,'VRCX',0) \
+                 ON CONFLICT(id) DO NOTHING",
+                [VRCX_DOMAIN_ID],
+            )
+            .map_err(|error| format!("cannot register VRCX domain: {error}"))?;
         let snapshot = read_snapshot(&database)?;
         let projection = Arc::new(project(&snapshot)?);
         Ok(Self {
@@ -330,6 +337,9 @@ impl GraphStore {
     }
 
     pub fn delete_domain(&self, id: &str) -> Result<(), String> {
+        if id == VRCX_DOMAIN_ID {
+            return Err("VRCX runtime domain cannot be deleted".into());
+        }
         self.edit(|transaction| {
             let count: i64 = transaction
                 .query_row(

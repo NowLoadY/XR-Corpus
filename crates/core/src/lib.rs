@@ -16,6 +16,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 pub const CORPUS_SCHEMA: &str = "xrtranslate-corpus/v1";
+pub const VRCX_DOMAIN_ID: &str = "vrcx";
 pub const CORPUS_LANGUAGE_ORDER: &[&str] = &[
     "zh", "en", "fr", "pt", "es", "ja", "ru", "ko", "th", "it", "de", "vi", "id", "pl", "cs", "nl",
 ];

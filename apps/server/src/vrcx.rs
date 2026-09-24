@@ -23,14 +23,14 @@ use serde::Deserialize;
 use tracing::{info, warn};
 use xr_corpus_core::{
     CORPUS_LANGUAGE_ORDER, CORPUS_SCHEMA, CorpusActivation, CorpusDefinition, CorpusTerm,
-    DynamicCorpusSource,
+    DynamicCorpusSource, VRCX_DOMAIN_ID,
 };
 use xr_corpus_protocol::VrcxStatusResponse;
 
 use crate::AppState;
 
 const PROVIDER_ID: &str = "vrcx";
-const RUNTIME_CORPUS_ID: &str = "virtual-worlds.vrchat.runtime-room";
+const RUNTIME_CORPUS_ID: &str = "vrcx.vrchat.runtime-room";
 const GAME_MODE_CORPUS_ID: &str = "virtual-worlds.vrchat.runtime-game-mode";
 const DATABASE_FILE: &str = "VRCX.sqlite3";
 const VRCX_CONFIG_FILE: &str = "VRCX.json";
@@ -466,7 +466,7 @@ fn room_corpus(room: &RoomSnapshot) -> Result<CorpusDefinition, String> {
     Ok(CorpusDefinition {
         schema: CORPUS_SCHEMA.into(),
         id: RUNTIME_CORPUS_ID.into(),
-        domain: "virtual-worlds".into(),
+        domain: VRCX_DOMAIN_ID.into(),
         subdomain: "vrchat".into(),
         title: "Current VRChat room".into(),
         priority: 1_000,
