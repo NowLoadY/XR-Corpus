@@ -50,7 +50,8 @@ and `edges`. Node positions are arranged automatically by the client and are
 not stored in the corpus database.
 Changes take effect in new ASR and translation selections without restarting the service.
 
-- `PUT /v2/graph/domains/{id}` saves a domain; `DELETE` removes an empty domain.
+- `PUT /v2/graph/domains/{id}` saves a domain with an optional `parent_id` (`null` for a root);
+  `DELETE` removes a domain only when it has no nodes or children.
 - `PUT /v2/graph/nodes/{id}` saves a node; `DELETE` removes a node but leaves its edges
   dormant so they can reconnect if that ID appears again.
 - `PUT /v2/graph/nodes` updates `enabled` and/or `domain_id` for a nonempty
@@ -60,11 +61,12 @@ Changes take effect in new ASR and translation selections without restarting the
   removes it.
 
 Mutations return the current complete graph. IDs in URL paths must match the JSON body.
-Nodes require an existing domain and exactly sixteen ordered language values. `activation`
+Nodes belong to one domain in the tree and require exactly sixteen ordered language values.
+The runtime corpus `subdomain` is derived from the first child below the root domain. `activation`
 is `always` or `on-evidence`; `promptable` controls whether a node can enter recognition
 and translation context. An `on-evidence` node needs an enabled incoming `trigger` edge.
 Incoming `context` edges express a second requirement: one enabled context source must also
-appear in the current evidence. Both endpoint nodes and their domains must be enabled.
+appear in the current evidence. Both endpoint nodes and every ancestor domain must be enabled.
 An edge whose source or target does not exist remains stored and becomes effective when
 that node appears again. The graph editor visualizes these edges as dormant.
 

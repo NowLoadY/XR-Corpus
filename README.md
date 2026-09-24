@@ -6,7 +6,8 @@ keeps bounded bilingual conversation history, and exposes HTTP and Rust client A
 
 ## Design
 
-- Each vocabulary node has a required domain and sixteen ordered language values. Directed
+- Domains form a tree, so games and their term categories can be managed independently. Each
+  vocabulary node has a required domain and sixteen ordered language values. Directed
   trigger and context edges connect nodes; an edge with a missing or disabled endpoint stays
   stored but does not activate vocabulary.
 - The editable graph lives in `runtime/xr-corpus.sqlite`. On first launch, the service copies
@@ -44,8 +45,8 @@ provider is included at [`crates/client/examples/publish_runtime.rs`](crates/cli
 The [graph API](API.md#vocabulary-graph) manages domains, nodes and directed edges. A node
 contains one concept, with values in the fixed language order
 `zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl`. Missing translations are empty strings.
-Disabling a domain, node or edge immediately removes its effect from subsequent selections;
-the stored content remains available for later editing.
+Disabling a domain or any ancestor, a node, or an edge immediately removes its effect from
+subsequent selections; the stored content remains available for later editing.
 
 ## Attribution
 

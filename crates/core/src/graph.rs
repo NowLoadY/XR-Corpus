@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CORPUS_SCHEMA, CorpusActivation, CorpusDefinition, CorpusTerm, VRCX_DOMAIN_ID};
 
-const DATABASE_VERSION: i64 = 3;
+const DATABASE_VERSION: i64 = 4;
 static NEXT_SEED_FILE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +22,7 @@ pub struct GraphDomain {
     pub id: String,
     pub title: String,
     pub enabled: bool,
+    pub parent_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -29,7 +30,6 @@ pub struct GraphDomain {
 pub struct GraphNode {
     pub id: String,
     pub domain_id: String,
-    pub subdomain: String,
     pub title: String,
     pub enabled: bool,
     pub promptable: bool,
@@ -193,12 +193,19 @@ impl GraphStore {
     pub fn upsert_domain(&self, domain: &GraphDomain) -> Result<(), String> {
         check_id(&domain.id, "domain ID")?;
         check_title(&domain.title, "domain title")?;
+        if let Some(parent_id) = &domain.parent_id {
+            check_id(parent_id, "parent domain ID")?;
+        }
+        if domain.id == VRCX_DOMAIN_ID && domain.parent_id.is_some() {
+            return Err("VRCX must remain a root domain".into());
+        }
         self.edit(|transaction| {
             transaction
                 .execute(
-                    "INSERT INTO domains (id,title,enabled) VALUES (?1,?2,?3) \
-                     ON CONFLICT(id) DO UPDATE SET title=excluded.title, enabled=excluded.enabled",
-                    params![domain.id, domain.title, domain.enabled],
+                    "INSERT INTO domains (id,title,enabled,parent_id) VALUES (?1,?2,?3,?4) \
+                     ON CONFLICT(id) DO UPDATE SET title=excluded.title, \
+                     enabled=excluded.enabled, parent_id=excluded.parent_id",
+                    params![domain.id, domain.title, domain.enabled, domain.parent_id],
                 )
                 .map_err(|error| format!("cannot save domain {}: {error}", domain.id))?;
             Ok(())
@@ -208,7 +215,6 @@ impl GraphStore {
     pub fn upsert_node(&self, node: &GraphNode) -> Result<(), String> {
         check_id(&node.id, "node ID")?;
         check_id(&node.domain_id, "node domain ID")?;
-        check_id(&node.subdomain, "node subdomain")?;
         check_title(&node.title, "node title")?;
         if node.activation == CorpusActivation::RuntimeOnly {
             return Err("runtime-only activation is reserved for transient providers".into());
@@ -237,17 +243,16 @@ impl GraphStore {
             transaction
                 .execute(
                     "INSERT INTO nodes \
-                     (id,domain_id,subdomain,title,enabled,promptable,activation,priority,values_json) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
+                     (id,domain_id,title,enabled,promptable,activation,priority,values_json) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8) \
                      ON CONFLICT(id) DO UPDATE SET \
-                     domain_id=excluded.domain_id,subdomain=excluded.subdomain,title=excluded.title, \
+                     domain_id=excluded.domain_id,title=excluded.title, \
                      enabled=excluded.enabled,promptable=excluded.promptable, \
                      activation=excluded.activation,priority=excluded.priority, \
                      values_json=excluded.values_json",
                     params![
                         node.id,
                         node.domain_id,
-                        node.subdomain,
                         node.title,
                         node.enabled,
                         node.promptable,
@@ -350,6 +355,18 @@ impl GraphStore {
                 .map_err(|error| format!("cannot inspect domain {id}: {error}"))?;
             if count != 0 {
                 return Err(format!("domain {id} still contains {count} nodes"));
+            }
+            let children: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM domains WHERE parent_id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("cannot inspect domain {id}: {error}"))?;
+            if children != 0 {
+                return Err(format!(
+                    "domain {id} still contains {children} child domains"
+                ));
             }
             transaction
                 .execute("DELETE FROM domains WHERE id=?1", [id])
@@ -479,7 +496,7 @@ fn database_version(database: &Connection) -> Result<i64, String> {
 fn migrate_database(database: &mut Connection) -> Result<(), String> {
     match database_version(database)? {
         DATABASE_VERSION => return Ok(()),
-        1 | 2 => {}
+        3 => {}
         version => {
             return Err(format!(
                 "unsupported corpus database version {version}; expected {DATABASE_VERSION}"
@@ -492,7 +509,7 @@ fn migrate_database(database: &mut Connection) -> Result<(), String> {
     let previous_version = database_version(&transaction)?;
     match previous_version {
         DATABASE_VERSION => return Ok(()),
-        1 | 2 => {}
+        3 => {}
         version => {
             return Err(format!(
                 "unsupported corpus database version {version}; expected {DATABASE_VERSION}"
@@ -500,12 +517,86 @@ fn migrate_database(database: &mut Connection) -> Result<(), String> {
         }
     }
     transaction
-        .execute_batch(match previous_version {
-            1 => "ALTER TABLE nodes DROP COLUMN x; ALTER TABLE nodes DROP COLUMN y;",
-            2 => "DROP TABLE node_positions;",
-            _ => unreachable!(),
-        })
+        .execute_batch(
+            "ALTER TABLE domains ADD COLUMN parent_id TEXT REFERENCES domains(id) ON DELETE RESTRICT; \
+             CREATE INDEX domains_parent_idx ON domains(parent_id);",
+        )
         .map_err(|error| format!("cannot migrate corpus database: {error}"))?;
+    let mut used_ids = HashSet::new();
+    {
+        let mut statement = transaction
+            .prepare("SELECT id FROM domains")
+            .map_err(|error| format!("cannot read domain IDs: {error}"))?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("cannot query domain IDs: {error}"))?;
+        for id in ids {
+            used_ids.insert(id.map_err(|error| format!("invalid domain ID: {error}"))?);
+        }
+    }
+    let groups = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT domain_id,subdomain FROM nodes \
+                 GROUP BY domain_id,subdomain ORDER BY domain_id,subdomain",
+            )
+            .map_err(|error| format!("cannot read node groups: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| format!("cannot query node groups: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("invalid node group: {error}"))?
+    };
+    for (parent_id, subdomain) in groups {
+        let group_id = unique_child_id(&parent_id, &subdomain, &mut used_ids);
+        transaction
+            .execute(
+                "INSERT INTO domains (id,title,enabled,parent_id) VALUES (?1,?2,1,?3)",
+                params![group_id, group_title(&subdomain), parent_id],
+            )
+            .map_err(|error| format!("cannot add domain {group_id}: {error}"))?;
+        transaction
+            .execute(
+                "UPDATE nodes SET domain_id=?1 WHERE domain_id=?2 AND subdomain=?3",
+                params![group_id, parent_id, subdomain],
+            )
+            .map_err(|error| format!("cannot group {parent_id}/{subdomain} nodes: {error}"))?;
+        if parent_id == "games" && subdomain == "overwatch" {
+            let heroes: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM nodes \
+                     WHERE domain_id=?1 AND id GLOB 'games.overwatch.heroes.*'",
+                    [&group_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("cannot inspect Overwatch heroes: {error}"))?;
+            if heroes != 0 {
+                let heroes_id = unique_child_id(&group_id, "heroes", &mut used_ids);
+                transaction
+                    .execute(
+                        "INSERT INTO domains (id,title,enabled,parent_id) VALUES (?1,'Heroes',1,?2)",
+                        params![heroes_id, group_id],
+                    )
+                    .map_err(|error| format!("cannot add Heroes domain: {error}"))?;
+                transaction
+                    .execute(
+                        "UPDATE nodes SET domain_id=?1 \
+                         WHERE domain_id=?2 AND id GLOB 'games.overwatch.heroes.*'",
+                        params![heroes_id, group_id],
+                    )
+                    .map_err(|error| format!("cannot group Overwatch heroes: {error}"))?;
+            }
+        }
+    }
+    transaction
+        .execute_batch(
+            "DROP INDEX nodes_by_domain; \
+             ALTER TABLE nodes DROP COLUMN subdomain; \
+             CREATE INDEX nodes_by_domain ON nodes(domain_id,enabled);",
+        )
+        .map_err(|error| format!("cannot finish corpus database migration: {error}"))?;
     transaction
         .pragma_update(None, "user_version", DATABASE_VERSION)
         .map_err(|error| format!("cannot set corpus database version: {error}"))?;
@@ -514,6 +605,54 @@ fn migrate_database(database: &mut Connection) -> Result<(), String> {
     transaction
         .commit()
         .map_err(|error| format!("cannot commit corpus database migration: {error}"))
+}
+
+fn unique_child_id(parent_id: &str, slug: &str, used_ids: &mut HashSet<String>) -> String {
+    let natural = format!("{parent_id}.{slug}");
+    if natural.chars().count() <= 256 && used_ids.insert(natural.clone()) {
+        return natural;
+    }
+    let hash = parent_id
+        .bytes()
+        .chain([0])
+        .chain(slug.bytes())
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
+    let base = format!("group-{hash:016x}");
+    let mut candidate = base.clone();
+    let mut suffix = 2;
+    while !used_ids.insert(candidate.clone()) {
+        candidate = format!("{base}-{suffix}");
+        suffix += 1;
+    }
+    candidate
+}
+
+fn group_title(slug: &str) -> String {
+    let title = slug
+        .split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .enumerate()
+        .map(|(index, part)| match part {
+            "vrchat" => "VRChat".to_owned(),
+            "lgbtq" => "LGBTQ".to_owned(),
+            "ai" => "AI".to_owned(),
+            "and" if index != 0 => "and".to_owned(),
+            _ => {
+                let mut chars = part.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().collect::<String>() + chars.as_str()
+                })
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() || title.chars().count() > 256 {
+        slug.to_owned()
+    } else {
+        title
+    }
 }
 
 fn check_database(database: &Connection) -> Result<(), String> {
@@ -535,7 +674,7 @@ fn check_database(database: &Connection) -> Result<(), String> {
 fn read_snapshot(database: &Connection) -> Result<GraphSnapshot, String> {
     let mut snapshot = GraphSnapshot::default();
     let mut statement = database
-        .prepare("SELECT id,title,enabled FROM domains ORDER BY id")
+        .prepare("SELECT id,title,enabled,parent_id FROM domains ORDER BY id")
         .map_err(|error| format!("cannot read domains: {error}"))?;
     let rows = statement
         .query_map([], |row| {
@@ -543,6 +682,7 @@ fn read_snapshot(database: &Connection) -> Result<GraphSnapshot, String> {
                 id: row.get(0)?,
                 title: row.get(1)?,
                 enabled: row.get(2)?,
+                parent_id: row.get(3)?,
             })
         })
         .map_err(|error| format!("cannot query domains: {error}"))?;
@@ -554,34 +694,32 @@ fn read_snapshot(database: &Connection) -> Result<GraphSnapshot, String> {
 
     let mut statement = database
         .prepare(
-            "SELECT id,domain_id,subdomain,title,enabled,promptable,activation,priority,values_json \
+            "SELECT id,domain_id,title,enabled,promptable,activation,priority,values_json \
              FROM nodes ORDER BY id",
         )
         .map_err(|error| format!("cannot read nodes: {error}"))?;
     let rows = statement
         .query_map([], |row| {
-            let activation: String = row.get(6)?;
-            let values: String = row.get(8)?;
+            let activation: String = row.get(5)?;
+            let values: String = row.get(7)?;
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
+                row.get::<_, bool>(3)?,
                 row.get::<_, bool>(4)?,
-                row.get::<_, bool>(5)?,
                 activation,
-                row.get::<_, i32>(7)?,
+                row.get::<_, i32>(6)?,
                 values,
             ))
         })
         .map_err(|error| format!("cannot query nodes: {error}"))?;
     for row in rows {
-        let (id, domain_id, subdomain, title, enabled, promptable, activation, priority, values) =
+        let (id, domain_id, title, enabled, promptable, activation, priority, values) =
             row.map_err(|error| format!("invalid node row: {error}"))?;
         snapshot.nodes.push(GraphNode {
             id,
             domain_id,
-            subdomain,
             title,
             enabled,
             promptable,
@@ -620,16 +758,91 @@ fn read_snapshot(database: &Connection) -> Result<GraphSnapshot, String> {
     Ok(snapshot)
 }
 
+#[derive(Clone, Copy)]
+struct DomainState<'a> {
+    root: &'a str,
+    first_child: Option<&'a str>,
+    enabled: bool,
+}
+
+impl DomainState<'_> {
+    fn subdomain(&self) -> &str {
+        self.first_child
+            .and_then(|id| id.strip_prefix(self.root)?.strip_prefix('.'))
+            .or(self.first_child)
+            .unwrap_or(self.root)
+    }
+}
+
+fn resolve_domain<'a>(
+    id: &'a str,
+    domains: &HashMap<&'a str, &'a GraphDomain>,
+    resolved: &mut HashMap<&'a str, DomainState<'a>>,
+) -> Result<DomainState<'a>, String> {
+    let mut path = Vec::new();
+    let mut current = id;
+    let mut state;
+    loop {
+        if let Some(&cached) = resolved.get(current) {
+            state = cached;
+            break;
+        }
+        if path.contains(&current) {
+            return Err(format!("domain {id} has a parent cycle"));
+        }
+        let domain = domains.get(current).ok_or_else(|| {
+            format!(
+                "domain {} has no parent {current}",
+                path.last().unwrap_or(&id)
+            )
+        })?;
+        path.push(current);
+        if let Some(parent_id) = domain.parent_id.as_deref() {
+            current = parent_id;
+        } else {
+            state = DomainState {
+                root: current,
+                first_child: None,
+                enabled: true,
+            };
+            break;
+        }
+    }
+    while let Some(next) = path.pop() {
+        let domain = domains[next];
+        state = DomainState {
+            root: state.root,
+            first_child: if domain.parent_id.is_some() && state.first_child.is_none() {
+                Some(next)
+            } else {
+                state.first_child
+            },
+            enabled: state.enabled && domain.enabled,
+        };
+        resolved.insert(next, state);
+    }
+    Ok(resolved[id])
+}
+
 fn project(snapshot: &GraphSnapshot) -> Result<GraphProjection, String> {
     let mut domains = HashMap::new();
-    let mut disabled_domains = HashSet::new();
     for domain in &snapshot.domains {
         check_id(&domain.id, "domain ID")?;
         check_title(&domain.title, "domain title")?;
-        if domains.insert(domain.id.as_str(), domain.enabled).is_some() {
+        if let Some(parent_id) = &domain.parent_id {
+            check_id(parent_id, "parent domain ID")?;
+        }
+        if domain.id == VRCX_DOMAIN_ID && domain.parent_id.is_some() {
+            return Err("VRCX must remain a root domain".into());
+        }
+        if domains.insert(domain.id.as_str(), domain).is_some() {
             return Err(format!("duplicate domain {}", domain.id));
         }
-        if !domain.enabled {
+    }
+    let mut domain_states = HashMap::new();
+    let mut disabled_domains = HashSet::new();
+    for domain in &snapshot.domains {
+        if !resolve_domain(&domain.id, &domains, &mut domain_states)?.enabled {
             disabled_domains.insert(domain.id.clone());
         }
     }
@@ -638,7 +851,6 @@ fn project(snapshot: &GraphSnapshot) -> Result<GraphProjection, String> {
     for node in &snapshot.nodes {
         check_id(&node.id, "node ID")?;
         check_id(&node.domain_id, "node domain ID")?;
-        check_id(&node.subdomain, "node subdomain")?;
         check_title(&node.title, "node title")?;
         if node.activation == CorpusActivation::RuntimeOnly {
             return Err(format!("node {} uses runtime-only activation", node.id));
@@ -673,8 +885,8 @@ fn project(snapshot: &GraphSnapshot) -> Result<GraphProjection, String> {
         };
         if !source.enabled
             || !target.enabled
-            || !domains[source.domain_id.as_str()]
-            || !domains[target.domain_id.as_str()]
+            || !domain_states[source.domain_id.as_str()].enabled
+            || !domain_states[target.domain_id.as_str()].enabled
         {
             continue;
         }
@@ -693,7 +905,7 @@ fn project(snapshot: &GraphSnapshot) -> Result<GraphProjection, String> {
     let mut groups: Vec<Group> = Vec::new();
     let mut group_indexes: HashMap<String, usize> = HashMap::new();
     for node in &snapshot.nodes {
-        if !node.enabled || !node.promptable || !domains[node.domain_id.as_str()] {
+        if !node.enabled || !node.promptable || !domain_states[node.domain_id.as_str()].enabled {
             continue;
         }
         let (mut triggers, mut trigger_aliases, mut activation_context) =
@@ -715,7 +927,6 @@ fn project(snapshot: &GraphSnapshot) -> Result<GraphProjection, String> {
         let signature = serde_json::to_string(&(
             &collection,
             &node.domain_id,
-            &node.subdomain,
             &node.title,
             node.priority,
             activation_name(node.activation),
@@ -742,8 +953,10 @@ fn project(snapshot: &GraphSnapshot) -> Result<GraphProjection, String> {
         let definition = CorpusDefinition {
             schema: CORPUS_SCHEMA.into(),
             id: String::new(),
-            domain: node.domain_id.clone(),
-            subdomain: node.subdomain.clone(),
+            domain: domain_states[node.domain_id.as_str()].root.to_owned(),
+            subdomain: domain_states[node.domain_id.as_str()]
+                .subdomain()
+                .to_owned(),
             title: node.title.clone(),
             priority: node.priority,
             activation: node.activation,
