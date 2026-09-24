@@ -3,11 +3,10 @@
 `default.sqlite` 是新安装的种子数据库。首次运行时，XR Corpus 将它复制到安装目录的
 `runtime/xr-corpus.sqlite`；此后只读写 `runtime` 中的用户数据库。软件更新会保留该文件。
 
-数据库使用 SQLite `user_version=2` 和 DELETE journal。退出 XRTranslate 后，可以直接复制
+数据库使用 SQLite `user_version=3` 和 DELETE journal。退出 XRTranslate 后，可以直接复制
 `runtime/xr-corpus.sqlite`，向另一位用户分享自己的领域、词汇和触发关系。
 
-节点位置独立存储在 `node_positions` 表；新安装的种子数据库没有预设坐标。图谱界面布局
-只有在用户保存位置时才写入数据库。已有 v1 用户数据库会在打开时保留词汇与旧坐标并迁移。
+图谱界面自动排列节点，不在数据库中存储节点位置。
 
 一个词汇节点保存 16 种语言中已知的表达，顺序为：
 

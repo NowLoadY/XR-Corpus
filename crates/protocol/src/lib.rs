@@ -3,8 +3,7 @@
 use serde::{Deserialize, Serialize};
 pub use xr_corpus_core::{
     CORPUS_LANGUAGE_ORDER, CORPUS_SCHEMA, CorpusActivation, CorpusDefinition, CorpusTerm,
-    GraphDomain, GraphEdge, GraphEdgeKind, GraphNode, GraphNodeStatePatch, GraphPosition,
-    GraphSnapshot,
+    GraphDomain, GraphEdge, GraphEdgeKind, GraphNode, GraphNodeStatePatch, GraphSnapshot,
 };
 pub const API_VERSION: u16 = 1;
 

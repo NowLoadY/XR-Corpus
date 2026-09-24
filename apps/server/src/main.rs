@@ -16,7 +16,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Path, State, rejection::JsonRejection},
+    extract::{Path, State},
     http::StatusCode,
     routing::{get, post, put},
 };
@@ -25,7 +25,7 @@ use serde::Deserialize;
 use tracing::{info, warn};
 use xr_corpus_core::{
     CorpusCatalog, CorpusConfig, DynamicCorpusSource, GraphDomain, GraphEdge, GraphNode,
-    GraphNodeStatePatch, GraphPosition, GraphSnapshot, GraphStore,
+    GraphNodeStatePatch, GraphSnapshot, GraphStore,
 };
 use xr_corpus_protocol::{
     API_VERSION, ContextBudgets, CreateSessionRequest, CreateSessionResponse, ErrorResponse,
@@ -158,7 +158,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/graph/nodes", put(patch_node_state))
         .route("/v1/graph/nodes/{id}", put(upsert_node).delete(delete_node))
-        .route("/v1/graph/positions", put(save_positions))
         .route("/v1/graph/edges", put(upsert_edge).delete(delete_edge))
         .route("/v1/integrations/vrcx/status", get(vrcx::get_status))
         .route(
@@ -253,19 +252,6 @@ async fn delete_node(
         .graph
         .delete_node(&id)
         .map_err(|message| bad_request("invalid_node", message))?;
-    graph_snapshot(State(state)).await
-}
-
-async fn save_positions(
-    State(state): State<AppState>,
-    payload: Result<Json<Vec<GraphPosition>>, JsonRejection>,
-) -> ApiResult<GraphSnapshot> {
-    let Json(positions) =
-        payload.map_err(|error| bad_request("invalid_positions", error.to_string()))?;
-    state
-        .graph
-        .save_positions(&positions)
-        .map_err(|message| bad_request("invalid_positions", message))?;
     graph_snapshot(State(state)).await
 }
 

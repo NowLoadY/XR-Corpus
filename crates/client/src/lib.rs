@@ -6,8 +6,8 @@ use reqwest::StatusCode;
 pub use xr_corpus_protocol as protocol;
 use xr_corpus_protocol::{
     API_VERSION, CreateSessionRequest, CreateSessionResponse, ErrorResponse, GraphDomain,
-    GraphEdge, GraphNode, GraphNodeStatePatch, GraphPosition, GraphSnapshot, HealthResponse,
-    PrepareAsrRequest, PrepareAsrResponse, PrepareTranslationRequest, PrepareTranslationResponse,
+    GraphEdge, GraphNode, GraphNodeStatePatch, GraphSnapshot, HealthResponse, PrepareAsrRequest,
+    PrepareAsrResponse, PrepareTranslationRequest, PrepareTranslationResponse,
     ProviderSnapshotResponse, PublishProviderRequest, RecordTranslationRequest,
     RecordTranslationResponse, SessionStateResponse, VrcxStatusResponse,
 };
@@ -154,10 +154,6 @@ impl CorpusClient {
 
     pub async fn save_node(&self, node: &GraphNode) -> CorpusResult<GraphSnapshot> {
         self.put(&graph_item_path("nodes", &node.id), node).await
-    }
-
-    pub async fn save_positions(&self, positions: &[GraphPosition]) -> CorpusResult<GraphSnapshot> {
-        self.put("/v1/graph/positions", &positions).await
     }
 
     pub async fn patch_node_state(

@@ -46,9 +46,8 @@ Snapshots are immutable and bounded; clients must not reuse old context IDs inde
 ## Vocabulary graph
 
 `GET /v1/graph` returns the editable persistent graph as `domains`, `nodes`,
-`positions`, and `edges`. Nodes contain vocabulary data; `positions` contains
-saved coordinates, including those preserved from an older user database. A new
-database has no saved positions.
+and `edges`. Node positions are arranged automatically by the client and are
+not stored in the corpus database.
 Changes take effect in new ASR and translation selections without restarting the service.
 
 - `PUT /v1/graph/domains/{id}` saves a domain; `DELETE` removes an empty domain.
@@ -57,10 +56,6 @@ Changes take effect in new ASR and translation selections without restarting the
 - `PUT /v1/graph/nodes` updates `enabled` and/or `domain_id` for a nonempty
   `ids` array in one transaction. Unknown or duplicate IDs and unknown domains reject
   the entire batch.
-- `PUT /v1/graph/positions` atomically saves coordinates only. Send an array of
-  `{ "id": "node-id", "x": 12.5, "y": -8.0 }` objects; every ID must exist and
-  coordinates must be finite. This does not rebuild activation state. Deleting a
-  node also deletes its saved position.
 - `PUT /v1/graph/edges` saves an edge; `DELETE /v1/graph/edges` with the edge as JSON
   removes it.
 

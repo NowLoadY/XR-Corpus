@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CORPUS_SCHEMA, CorpusActivation, CorpusDefinition, CorpusTerm};
 
-const DATABASE_VERSION: i64 = 2;
+const DATABASE_VERSION: i64 = 3;
 static NEXT_SEED_FILE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,13 +36,6 @@ pub struct GraphNode {
     pub activation: CorpusActivation,
     pub priority: i32,
     pub values: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct GraphPosition {
-    pub id: String,
-    pub x: f32,
-    pub y: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,7 +81,6 @@ pub struct GraphEdge {
 pub struct GraphSnapshot {
     pub domains: Vec<GraphDomain>,
     pub nodes: Vec<GraphNode>,
-    pub positions: Vec<GraphPosition>,
     pub edges: Vec<GraphEdge>,
 }
 
@@ -260,68 +252,6 @@ impl GraphStore {
                 .map_err(|error| format!("cannot save node {}: {error}", node.id))?;
             Ok(())
         })
-    }
-
-    pub fn save_positions(&self, positions: &[GraphPosition]) -> Result<(), String> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "graph store lock is poisoned".to_owned())?;
-        let mut seen = HashSet::with_capacity(positions.len());
-        let mut changed = Vec::new();
-        for position in positions {
-            check_id(&position.id, "node ID")?;
-            if !position.x.is_finite() || !position.y.is_finite() {
-                return Err(format!("node {} has non-finite coordinates", position.id));
-            }
-            if !seen.insert(position.id.as_str()) {
-                return Err(format!("duplicate node position {}", position.id));
-            }
-            state
-                .snapshot
-                .nodes
-                .binary_search_by(|node| node.id.as_str().cmp(&position.id))
-                .map_err(|_| format!("unknown graph node {}", position.id))?;
-            let saved = state
-                .snapshot
-                .positions
-                .binary_search_by(|saved| saved.id.as_str().cmp(&position.id))
-                .ok()
-                .map(|index| &state.snapshot.positions[index]);
-            if saved != Some(position) {
-                changed.push(position);
-            }
-        }
-        if changed.is_empty() {
-            return Ok(());
-        }
-        let transaction = state
-            .database
-            .transaction()
-            .map_err(|error| format!("cannot start position edit: {error}"))?;
-        for position in &changed {
-            transaction
-                .execute(
-                    "INSERT INTO node_positions (id,x,y) VALUES (?1,?2,?3) \
-                     ON CONFLICT(id) DO UPDATE SET x=excluded.x,y=excluded.y",
-                    params![position.id, position.x, position.y],
-                )
-                .map_err(|error| format!("cannot save position {}: {error}", position.id))?;
-        }
-        transaction
-            .commit()
-            .map_err(|error| format!("cannot commit position edit: {error}"))?;
-        for position in changed {
-            match state
-                .snapshot
-                .positions
-                .binary_search_by(|saved| saved.id.cmp(&position.id))
-            {
-                Ok(index) => state.snapshot.positions[index] = position.clone(),
-                Err(index) => state.snapshot.positions.insert(index, position.clone()),
-            }
-        }
-        Ok(())
     }
 
     pub fn patch_node_state(&self, patch: &GraphNodeStatePatch) -> Result<(), String> {
@@ -539,7 +469,7 @@ fn database_version(database: &Connection) -> Result<i64, String> {
 fn migrate_database(database: &mut Connection) -> Result<(), String> {
     match database_version(database)? {
         DATABASE_VERSION => return Ok(()),
-        1 => {}
+        1 | 2 => {}
         version => {
             return Err(format!(
                 "unsupported corpus database version {version}; expected {DATABASE_VERSION}"
@@ -549,9 +479,10 @@ fn migrate_database(database: &mut Connection) -> Result<(), String> {
     let transaction = database
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| format!("cannot start corpus database migration: {error}"))?;
-    match database_version(&transaction)? {
+    let previous_version = database_version(&transaction)?;
+    match previous_version {
         DATABASE_VERSION => return Ok(()),
-        1 => {}
+        1 | 2 => {}
         version => {
             return Err(format!(
                 "unsupported corpus database version {version}; expected {DATABASE_VERSION}"
@@ -559,16 +490,11 @@ fn migrate_database(database: &mut Connection) -> Result<(), String> {
         }
     }
     transaction
-        .execute_batch(
-            "CREATE TABLE node_positions (
-                id TEXT PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-                x REAL NOT NULL,
-                y REAL NOT NULL
-             ) WITHOUT ROWID;
-             INSERT INTO node_positions (id,x,y) SELECT id,x,y FROM nodes;
-             ALTER TABLE nodes DROP COLUMN x;
-             ALTER TABLE nodes DROP COLUMN y;",
-        )
+        .execute_batch(match previous_version {
+            1 => "ALTER TABLE nodes DROP COLUMN x; ALTER TABLE nodes DROP COLUMN y;",
+            2 => "DROP TABLE node_positions;",
+            _ => unreachable!(),
+        })
         .map_err(|error| format!("cannot migrate corpus database: {error}"))?;
     transaction
         .pragma_update(None, "user_version", DATABASE_VERSION)
@@ -654,33 +580,6 @@ fn read_snapshot(database: &Connection) -> Result<GraphSnapshot, String> {
             values: serde_json::from_str(&values)
                 .map_err(|error| format!("invalid node values: {error}"))?,
         });
-    }
-
-    let mut statement = database
-        .prepare("SELECT id,x,y FROM node_positions ORDER BY id")
-        .map_err(|error| format!("cannot read node positions: {error}"))?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok(GraphPosition {
-                id: row.get(0)?,
-                x: row.get(1)?,
-                y: row.get(2)?,
-            })
-        })
-        .map_err(|error| format!("cannot query node positions: {error}"))?;
-    for row in rows {
-        let position = row.map_err(|error| format!("invalid node position: {error}"))?;
-        if !position.x.is_finite() || !position.y.is_finite() {
-            return Err(format!("node {} has non-finite coordinates", position.id));
-        }
-        if snapshot
-            .nodes
-            .binary_search_by(|node| node.id.cmp(&position.id))
-            .is_err()
-        {
-            return Err(format!("position has no graph node {}", position.id));
-        }
-        snapshot.positions.push(position);
     }
 
     let mut statement = database

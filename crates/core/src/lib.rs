@@ -3,8 +3,8 @@
 mod graph;
 
 pub use graph::{
-    GraphDomain, GraphEdge, GraphEdgeKind, GraphNode, GraphNodeStatePatch, GraphPosition,
-    GraphSnapshot, GraphStore, validate_seed_database,
+    GraphDomain, GraphEdge, GraphEdgeKind, GraphNode, GraphNodeStatePatch, GraphSnapshot,
+    GraphStore, validate_seed_database,
 };
 
 use std::{
