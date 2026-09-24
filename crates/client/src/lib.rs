@@ -5,10 +5,11 @@ use std::time::Duration;
 use reqwest::StatusCode;
 pub use xr_corpus_protocol as protocol;
 use xr_corpus_protocol::{
-    API_VERSION, CreateSessionRequest, CreateSessionResponse, ErrorResponse, HealthResponse,
-    PrepareAsrRequest, PrepareAsrResponse, PrepareTranslationRequest, PrepareTranslationResponse,
-    ProviderSnapshotResponse, PublishProviderRequest, RecordTranslationRequest,
-    RecordTranslationResponse, SessionStateResponse, VrcxStatusResponse,
+    API_VERSION, CreateSessionRequest, CreateSessionResponse, ErrorResponse, GraphDomain,
+    GraphEdge, GraphNode, GraphSnapshot, HealthResponse, PrepareAsrRequest, PrepareAsrResponse,
+    PrepareTranslationRequest, PrepareTranslationResponse, ProviderSnapshotResponse,
+    PublishProviderRequest, RecordTranslationRequest, RecordTranslationResponse,
+    SessionStateResponse, VrcxStatusResponse,
 };
 
 pub type CorpusResult<T> = Result<T, CorpusClientError>;
@@ -137,6 +138,38 @@ impl CorpusClient {
         self.get("/v1/integrations/vrcx/status").await
     }
 
+    pub async fn graph(&self) -> CorpusResult<GraphSnapshot> {
+        self.get("/v1/graph").await
+    }
+
+    pub async fn save_domain(&self, domain: &GraphDomain) -> CorpusResult<GraphSnapshot> {
+        self.put(&format!("/v1/graph/domains/{}", domain.id), domain)
+            .await
+    }
+
+    pub async fn remove_domain(&self, id: &str) -> CorpusResult<GraphSnapshot> {
+        self.delete_graph(&format!("/v1/graph/domains/{id}"), None::<&GraphEdge>)
+            .await
+    }
+
+    pub async fn save_node(&self, node: &GraphNode) -> CorpusResult<GraphSnapshot> {
+        self.put(&format!("/v1/graph/nodes/{}", node.id), node)
+            .await
+    }
+
+    pub async fn remove_node(&self, id: &str) -> CorpusResult<GraphSnapshot> {
+        self.delete_graph(&format!("/v1/graph/nodes/{id}"), None::<&GraphEdge>)
+            .await
+    }
+
+    pub async fn save_edge(&self, edge: &GraphEdge) -> CorpusResult<GraphSnapshot> {
+        self.put("/v1/graph/edges", edge).await
+    }
+
+    pub async fn remove_edge(&self, edge: &GraphEdge) -> CorpusResult<GraphSnapshot> {
+        self.delete_graph("/v1/graph/edges", Some(edge)).await
+    }
+
     pub async fn publish_provider(
         &self,
         provider_id: &str,
@@ -189,6 +222,20 @@ impl CorpusClient {
                 .map_err(request_error)?,
         )
         .await
+    }
+
+    async fn delete_graph<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: Option<B>,
+    ) -> CorpusResult<T> {
+        let request = self.http.delete(format!("{}{path}", self.base_url));
+        let request = if let Some(body) = body {
+            request.json(&body)
+        } else {
+            request
+        };
+        decode(request.send().await.map_err(request_error)?).await
     }
 
     async fn delete(&self, path: &str) -> CorpusResult<()> {

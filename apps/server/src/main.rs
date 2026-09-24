@@ -23,7 +23,10 @@ use axum::{
 use clap::Parser;
 use serde::Deserialize;
 use tracing::{info, warn};
-use xr_corpus_core::{CorpusCatalog, CorpusConfig, DynamicCorpusSource};
+use xr_corpus_core::{
+    CorpusCatalog, CorpusConfig, DynamicCorpusSource, GraphDomain, GraphEdge, GraphNode,
+    GraphSnapshot, GraphStore,
+};
 use xr_corpus_protocol::{
     API_VERSION, ContextBudgets, CreateSessionRequest, CreateSessionResponse, ErrorResponse,
     HealthResponse, PrepareAsrRequest, PrepareAsrResponse, PrepareTranslationRequest,
@@ -52,6 +55,7 @@ struct Arguments {
 struct AppState {
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<CorpusSession>>>>>,
     catalog: CorpusCatalog,
+    graph: GraphStore,
     config: CorpusConfig,
     next_session_id: Arc<AtomicU64>,
     session_ttl: Duration,
@@ -125,6 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let catalog = CorpusCatalog::load(&config.prompt_context, &project_root)?;
+    let graph = catalog.graph_store().ok_or("graph store unavailable")?;
     let corpus_count = catalog.snapshot()?.len();
     let dynamic_source = catalog.dynamic_source();
     let vrcx = vrcx::VrcxRuntimeSource::new(
@@ -136,6 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         catalog,
+        graph,
         config: config.prompt_context,
         next_session_id: Arc::new(AtomicU64::new(1)),
         session_ttl: Duration::from_secs(args.session_idle_seconds.max(30)),
@@ -145,6 +151,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     spawn_session_reaper(state.clone());
     let app = Router::new()
         .route("/healthz", get(health))
+        .route("/v1/graph", get(graph_snapshot))
+        .route(
+            "/v1/graph/domains/{id}",
+            put(upsert_domain).delete(delete_domain),
+        )
+        .route("/v1/graph/nodes/{id}", put(upsert_node).delete(delete_node))
+        .route("/v1/graph/edges", put(upsert_edge).delete(delete_edge))
         .route("/v1/integrations/vrcx/status", get(vrcx::get_status))
         .route(
             "/v1/providers/{provider_id}",
@@ -183,6 +196,84 @@ async fn health(State(state): State<AppState>) -> ApiResult<HealthResponse> {
         corpus_count,
         session_count,
     }))
+}
+
+async fn graph_snapshot(State(state): State<AppState>) -> ApiResult<GraphSnapshot> {
+    Ok(Json(state.graph.snapshot().map_err(internal_error)?))
+}
+
+async fn upsert_domain(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(domain): Json<GraphDomain>,
+) -> ApiResult<GraphSnapshot> {
+    if id != domain.id {
+        return Err(bad_request("id_mismatch", "domain ID differs from URL"));
+    }
+    state
+        .graph
+        .upsert_domain(&domain)
+        .map_err(|message| bad_request("invalid_domain", message))?;
+    graph_snapshot(State(state)).await
+}
+
+async fn delete_domain(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<GraphSnapshot> {
+    state
+        .graph
+        .delete_domain(&id)
+        .map_err(|message| bad_request("invalid_domain", message))?;
+    graph_snapshot(State(state)).await
+}
+
+async fn upsert_node(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(node): Json<GraphNode>,
+) -> ApiResult<GraphSnapshot> {
+    if id != node.id {
+        return Err(bad_request("id_mismatch", "node ID differs from URL"));
+    }
+    state
+        .graph
+        .upsert_node(&node)
+        .map_err(|message| bad_request("invalid_node", message))?;
+    graph_snapshot(State(state)).await
+}
+
+async fn delete_node(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<GraphSnapshot> {
+    state
+        .graph
+        .delete_node(&id)
+        .map_err(|message| bad_request("invalid_node", message))?;
+    graph_snapshot(State(state)).await
+}
+
+async fn upsert_edge(
+    State(state): State<AppState>,
+    Json(edge): Json<GraphEdge>,
+) -> ApiResult<GraphSnapshot> {
+    state
+        .graph
+        .upsert_edge(&edge)
+        .map_err(|message| bad_request("invalid_edge", message))?;
+    graph_snapshot(State(state)).await
+}
+
+async fn delete_edge(
+    State(state): State<AppState>,
+    Json(edge): Json<GraphEdge>,
+) -> ApiResult<GraphSnapshot> {
+    state
+        .graph
+        .delete_edge(&edge.source_id, &edge.target_id, edge.kind)
+        .map_err(|message| bad_request("invalid_edge", message))?;
+    graph_snapshot(State(state)).await
 }
 
 async fn create_session(

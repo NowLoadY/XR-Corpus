@@ -43,6 +43,31 @@ Do not branch on the English `error` text.
 `GET /v1/sessions/{id}` exposes active corpus IDs and retained snapshot count for diagnostics.
 Snapshots are immutable and bounded; clients must not reuse old context IDs indefinitely.
 
+## Vocabulary graph
+
+`GET /v1/graph` returns the editable persistent graph as `domains`, `nodes`, and `edges`.
+Changes take effect in new ASR and translation selections without restarting the service.
+
+- `PUT /v1/graph/domains/{id}` saves a domain; `DELETE` removes an empty domain.
+- `PUT /v1/graph/nodes/{id}` saves a node; `DELETE` removes a node but leaves its edges
+  dormant so they can reconnect if that ID appears again.
+- `PUT /v1/graph/edges` saves an edge; `DELETE /v1/graph/edges` with the edge as JSON
+  removes it.
+
+Mutations return the current complete graph. IDs in URL paths must match the JSON body.
+Nodes require an existing domain and exactly sixteen ordered language values. `activation`
+is `always` or `on-evidence`; `promptable` controls whether a node can enter recognition
+and translation context. An `on-evidence` node needs an enabled incoming `trigger` edge.
+Incoming `context` edges express a second requirement: one enabled context source must also
+appear in the current evidence. Both endpoint nodes and their domains must be enabled.
+An edge whose source or target does not exist remains stored and becomes effective when
+that node appears again. The graph editor visualizes these edges as dormant.
+
+The database is `runtime/xr-corpus.sqlite`, initialized once from the packaged
+`corpora/default.sqlite`. Stop XRTranslate before copying the user database to another
+installation. The service never replaces an existing user database merely because the
+application version changed.
+
 ## Runtime providers
 
 External programs publish current room names, player names, project terminology, or similar
@@ -89,4 +114,4 @@ remain empty columns. The Rust types validate schema IDs, column count, limits, 
 - Dynamic provider data expires by TTL.
 - Session history and context snapshots are bounded.
 - Prompt budgets come from the active ASR and translation models, not hard-coded model names.
-- Static Markdown and dynamic providers enter the same ranking and activation pipeline.
+- Persistent graph nodes and dynamic providers enter the same ranking and activation pipeline.

@@ -1,14 +1,21 @@
 # XR Corpus
 
 XR Corpus is a local, session-aware terminology service for speech recognition and translation.
-It loads versioned Markdown corpora, selects relevant terminology within each model's budget,
-keeps bounded bilingual conversation history, and exposes stable HTTP and Rust client APIs.
+It selects vocabulary from a user-editable SQLite concept graph within each model's budget,
+keeps bounded bilingual conversation history, and exposes HTTP and Rust client APIs.
 
 ## Design
 
-- Markdown remains the source of truth for static corpora.
+- Each vocabulary node has a required domain and sixteen ordered language values. Directed
+  trigger and context edges connect nodes; an edge with a missing or disabled endpoint stays
+  stored but does not activate vocabulary.
+- The editable graph lives in `runtime/xr-corpus.sqlite`. On first launch, the service copies
+  `corpora/default.sqlite` into that location. Later launches and ordinary application updates
+  keep the user's database. SQLite schema changes are governed by `PRAGMA user_version`.
+- The database uses rollback journaling, so a stopped application's graph can be shared by
+  copying one file.
 - Activation state and context snapshots belong to a server-side session.
-- Static corpora and short-lived runtime providers use one catalog contract.
+- The persistent graph and short-lived runtime providers enter one selection pipeline.
 - Callers receive stable, neutral context data and provenance spans, not
   rendered translation prompts or internal catalog/UI template objects.
 - Idle sessions, snapshots, and dynamic data are bounded and expire automatically.
@@ -32,10 +39,13 @@ let session = corpus.create_session().await?;
 session lifecycle, dynamic-provider contract, error format, and curl examples. A compilable runtime
 provider is included at [`crates/client/examples/publish_runtime.rs`](crates/client/examples/publish_runtime.rs).
 
-## Corpus format
+## Vocabulary graph
 
-See [`corpora/v1/SCHEMA.md`](corpora/v1/SCHEMA.md). Each terminology row uses the fixed language
-order declared in the file and leaves unavailable translations empty between English commas.
+The [graph API](API.md#vocabulary-graph) manages domains, nodes and directed edges. A node
+contains one concept, with values in the fixed language order
+`zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl`. Missing translations are empty strings.
+Disabling a domain, node or edge immediately removes its effect from subsequent selections;
+the stored content remains available for later editing.
 
 ## Attribution
 

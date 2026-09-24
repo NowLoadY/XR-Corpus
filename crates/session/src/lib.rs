@@ -377,6 +377,7 @@ pub struct PromptContextManager {
     active_corpus_ids: HashSet<String>,
     active_corpus_idle_turns: HashMap<String, u8>,
     dormant_corpus_ids: HashSet<String>,
+    graph_revision: u64,
 }
 
 impl PromptContextManager {
@@ -419,6 +420,7 @@ impl PromptContextManager {
             active_corpus_ids: HashSet::new(),
             active_corpus_idle_turns: HashMap::new(),
             dormant_corpus_ids: HashSet::new(),
+            graph_revision: 0,
             config,
             catalog,
         })
@@ -614,9 +616,27 @@ impl PromptContextManager {
         if languages.is_empty() {
             return Ok(PromptContextSnapshot::default());
         }
-        let mut corpora = self.matching_corpora(&languages, hints)?;
+        let (catalog_snapshot, revision) = self.catalog.snapshot_with_revision()?;
+        if self.graph_revision != revision {
+            self.active_corpus_ids.clear();
+            self.active_corpus_idle_turns.clear();
+            self.dormant_corpus_ids.clear();
+            self.graph_revision = revision;
+        }
+        let runtime_activation_terms = self.catalog.runtime_activation_terms()?;
+        let mut corpora = self.matching_corpora(
+            &languages,
+            hints,
+            &catalog_snapshot,
+            &runtime_activation_terms,
+        );
         if self.update_active_corpora(&corpora, advance_turn) {
-            corpora = self.matching_corpora(&languages, hints)?;
+            corpora = self.matching_corpora(
+                &languages,
+                hints,
+                &catalog_snapshot,
+                &runtime_activation_terms,
+            );
         }
         let terms = selected_term_rows(&corpora, &languages);
         let mut translation_candidates = terms.clone();
@@ -745,7 +765,9 @@ impl PromptContextManager {
         &self,
         languages: &[String],
         hints: &[&str],
-    ) -> Result<Vec<SelectedCorpus>, String> {
+        snapshot: &[CorpusDefinition],
+        runtime_activation_terms: &[CorpusTerm],
+    ) -> Vec<SelectedCorpus> {
         let mut evidence =
             fold_for_match(
                 &self
@@ -763,32 +785,25 @@ impl PromptContextManager {
         // runtime facts), never by combining unrelated words from separate
         // history entries. Confirmed active state is retained separately.
         let mut activation_evidence = current_evidence.clone();
-        let snapshot = self.catalog.snapshot()?;
-        // Runtime `Always` corpora provide mode evidence. Static `Always` corpora
-        // (such as default platform entries) provide candidate vocabulary terms
-        // without falsely claiming the user is currently speaking in that mode.
-        // Runtime-only corpora remain prompt data, but do not activate static
-        // specialist glossaries by themselves.
-        for corpus in snapshot
-            .iter()
-            .filter(|corpus| corpus.activation == CorpusActivation::Always && corpus.id.contains("runtime"))
-        {
-            for term in &corpus.terms {
-                for value in languages.iter().filter_map(|language| term.value(language)) {
-                    evidence.push(' ');
-                    evidence.push_str(&fold_for_match(value));
-                    evidence.push(' ');
-                    evidence.push_str(&fold_for_match(&split_identifier_words(value)));
-                    activation_evidence.push(' ');
-                    activation_evidence.push_str(&fold_for_match(value));
-                    activation_evidence.push(' ');
-                    activation_evidence.push_str(&fold_for_match(&split_identifier_words(value)));
-                }
+        // Live provider facts can activate specialist vocabulary. The catalog
+        // identifies their source explicitly; a user node's ID is never used
+        // to infer whether it came from a live integration.
+        for term in runtime_activation_terms {
+            for value in languages.iter().filter_map(|language| term.value(language)) {
+                evidence.push(' ');
+                evidence.push_str(&fold_for_match(value));
+                evidence.push(' ');
+                evidence.push_str(&fold_for_match(&split_identifier_words(value)));
+                activation_evidence.push(' ');
+                activation_evidence.push_str(&fold_for_match(value));
+                activation_evidence.push(' ');
+                activation_evidence.push_str(&fold_for_match(&split_identifier_words(value)));
             }
         }
 
         let mut matches = snapshot
-            .into_iter()
+            .iter()
+            .cloned()
             .enumerate()
             .filter_map(|(index, corpus)| {
                 let matched_triggers = corpus
@@ -901,10 +916,10 @@ impl PromptContextManager {
                 .then_with(|| right.1.cmp(&left.1))
                 .then_with(|| left.2.cmp(&right.2))
         });
-        Ok(matches
+        matches
             .into_iter()
             .map(|(_, _, _, corpus)| corpus)
-            .collect())
+            .collect()
     }
 }
 
@@ -1806,7 +1821,12 @@ mod tests {
                 .iter()
                 .any(|term| term == "ERes2NetV2")
         );
-        assert!(!snapshot.asr_vocabulary().iter().any(|term| term == "Hello Mercy"));
+        assert!(
+            !snapshot
+                .asr_vocabulary()
+                .iter()
+                .any(|term| term == "Hello Mercy")
+        );
         assert!(!asr.contains("Hello Mercy"));
         assert!(
             snapshot
@@ -3036,19 +3056,31 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_catalog_does_not_activate_vrchat_community_language_without_evidence_or_runtime() {
+    fn checked_in_catalog_does_not_activate_vrchat_community_language_without_evidence_or_runtime()
+    {
         let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
         let mut context = PromptContextManager::new(config(), catalog.clone()).unwrap();
 
         // 1. Unrelated speech when VRChat is not running: VRChat community language is NOT active.
         let snapshot = context
-            .select("auto", "zh,en", &["Hello, how are you today?"], (1_000, 1_000))
+            .select(
+                "auto",
+                "zh,en",
+                &["Hello, how are you today?"],
+                (1_000, 1_000),
+            )
             .unwrap();
         let prompt = snapshot.translation_prompt();
         if let Some(prompt_text) = prompt {
-            assert!(!prompt_text.contains("男娘,femboy"), "VRChat community language should not activate on unrelated speech");
-            assert!(!prompt_text.contains("面部追踪,face tracking"), "face tracking should not activate on unrelated speech");
+            assert!(
+                !prompt_text.contains("男娘,femboy"),
+                "VRChat community language should not activate on unrelated speech"
+            );
+            assert!(
+                !prompt_text.contains("面部追踪,face tracking"),
+                "face tracking should not activate on unrelated speech"
+            );
         }
         // Entry platform term VRChat is not active on unrelated speech when not running VRChat.
         let asr = snapshot.asr_prompt();
@@ -3073,10 +3105,21 @@ mod tests {
             .unwrap();
         let mut running_context = PromptContextManager::new(config(), catalog).unwrap();
         let running_snapshot = running_context
-            .select("auto", "zh,en", &["Hello, how are you today?"], (1_000, 1_000))
+            .select(
+                "auto",
+                "zh,en",
+                &["Hello, how are you today?"],
+                (1_000, 1_000),
+            )
             .unwrap();
         let running_prompt = running_snapshot.translation_prompt().unwrap();
-        assert!(running_prompt.contains("男娘,femboy"), "VRChat running mode should activate community language by default");
-        assert!(running_prompt.contains("摸摸,headpat"), "VRChat running mode should activate community language by default");
+        assert!(
+            running_prompt.contains("男娘,femboy"),
+            "VRChat running mode should activate community language by default"
+        );
+        assert!(
+            running_prompt.contains("摸摸,headpat"),
+            "VRChat running mode should activate community language by default"
+        );
     }
 }

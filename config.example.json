@@ -6,7 +6,8 @@
     "translation_max_chars": 1200,
     "asr_history_entries": 1,
     "translation_history_entries": 6,
-    "corpora_directory": "corpora/v1"
+    "database_path": "runtime/xr-corpus.sqlite",
+    "seed_database_path": "corpora/default.sqlite"
   },
   "integrations": {
     "vrcx": {
