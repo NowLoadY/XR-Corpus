@@ -45,12 +45,22 @@ Snapshots are immutable and bounded; clients must not reuse old context IDs inde
 
 ## Vocabulary graph
 
-`GET /v1/graph` returns the editable persistent graph as `domains`, `nodes`, and `edges`.
+`GET /v1/graph` returns the editable persistent graph as `domains`, `nodes`,
+`positions`, and `edges`. Nodes contain vocabulary data; `positions` contains
+saved coordinates, including those preserved from an older user database. A new
+database has no saved positions.
 Changes take effect in new ASR and translation selections without restarting the service.
 
 - `PUT /v1/graph/domains/{id}` saves a domain; `DELETE` removes an empty domain.
 - `PUT /v1/graph/nodes/{id}` saves a node; `DELETE` removes a node but leaves its edges
   dormant so they can reconnect if that ID appears again.
+- `PUT /v1/graph/nodes` updates `enabled` and/or `domain_id` for a nonempty
+  `ids` array in one transaction. Unknown or duplicate IDs and unknown domains reject
+  the entire batch.
+- `PUT /v1/graph/positions` atomically saves coordinates only. Send an array of
+  `{ "id": "node-id", "x": 12.5, "y": -8.0 }` objects; every ID must exist and
+  coordinates must be finite. This does not rebuild activation state. Deleting a
+  node also deletes its saved position.
 - `PUT /v1/graph/edges` saves an edge; `DELETE /v1/graph/edges` with the edge as JSON
   removes it.
 
@@ -65,8 +75,9 @@ that node appears again. The graph editor visualizes these edges as dormant.
 
 The database is `runtime/xr-corpus.sqlite`, initialized once from the packaged
 `corpora/default.sqlite`. Stop XRTranslate before copying the user database to another
-installation. The service never replaces an existing user database merely because the
-application version changed.
+installation. The service keeps the user database across ordinary application updates.
+When the database format changes, it migrates the existing runtime database in one
+transaction before opening it.
 
 ## Runtime providers
 

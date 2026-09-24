@@ -9,12 +9,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OpenFlags, Transaction, params};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::{CORPUS_SCHEMA, CorpusActivation, CorpusDefinition, CorpusTerm};
 
-const DATABASE_VERSION: i64 = 1;
+const DATABASE_VERSION: i64 = 2;
 static NEXT_SEED_FILE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +25,7 @@ pub struct GraphDomain {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GraphNode {
     pub id: String,
     pub domain_id: String,
@@ -35,8 +36,20 @@ pub struct GraphNode {
     pub activation: CorpusActivation,
     pub priority: i32,
     pub values: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GraphPosition {
+    pub id: String,
     pub x: f32,
     pub y: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphNodeStatePatch {
+    pub ids: Vec<String>,
+    pub enabled: Option<bool>,
+    pub domain_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -75,6 +88,7 @@ pub struct GraphEdge {
 pub struct GraphSnapshot {
     pub domains: Vec<GraphDomain>,
     pub nodes: Vec<GraphNode>,
+    pub positions: Vec<GraphPosition>,
     pub edges: Vec<GraphEdge>,
 }
 
@@ -135,18 +149,19 @@ impl GraphStore {
                 }
             }
         }
-        let database = Connection::open(runtime_db)
+        let mut database = Connection::open(runtime_db)
             .map_err(|error| format!("cannot open {}: {error}", runtime_db.display()))?;
-        check_database(&database)?;
+        database
+            .pragma_update(None, "busy_timeout", 3000)
+            .map_err(|error| format!("cannot set database busy timeout: {error}"))?;
         database
             .pragma_update(None, "journal_mode", "DELETE")
             .map_err(|error| format!("cannot set database journal mode: {error}"))?;
         database
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|error| format!("cannot enable database foreign keys: {error}"))?;
-        database
-            .pragma_update(None, "busy_timeout", 3000)
-            .map_err(|error| format!("cannot set database busy timeout: {error}"))?;
+        migrate_database(&mut database)?;
+        check_database(&database)?;
         let snapshot = read_snapshot(&database)?;
         let projection = Arc::new(project(&snapshot)?);
         Ok(Self {
@@ -203,11 +218,8 @@ impl GraphStore {
             ordered_values: node.values.clone(),
         }
         .validate("graph node")?;
-        if !node.x.is_finite() || !node.y.is_finite() {
-            return Err("node coordinates must be finite".into());
-        }
         {
-            let mut state = self
+            let state = self
                 .state
                 .lock()
                 .map_err(|_| "graph store lock is poisoned".to_owned())?;
@@ -215,21 +227,8 @@ impl GraphStore {
                 .snapshot
                 .nodes
                 .binary_search_by(|existing| existing.id.cmp(&node.id))
-                && same_inference_fields(&state.snapshot.nodes[index], node)
+                && state.snapshot.nodes[index] == *node
             {
-                if state.snapshot.nodes[index].x != node.x
-                    || state.snapshot.nodes[index].y != node.y
-                {
-                    state
-                        .database
-                        .execute(
-                            "UPDATE nodes SET x=?1,y=?2 WHERE id=?3",
-                            params![node.x, node.y, node.id],
-                        )
-                        .map_err(|error| format!("cannot move node {}: {error}", node.id))?;
-                    state.snapshot.nodes[index].x = node.x;
-                    state.snapshot.nodes[index].y = node.y;
-                }
                 return Ok(());
             }
         }
@@ -239,13 +238,13 @@ impl GraphStore {
             transaction
                 .execute(
                     "INSERT INTO nodes \
-                     (id,domain_id,subdomain,title,enabled,promptable,activation,priority,values_json,x,y) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
+                     (id,domain_id,subdomain,title,enabled,promptable,activation,priority,values_json) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
                      ON CONFLICT(id) DO UPDATE SET \
                      domain_id=excluded.domain_id,subdomain=excluded.subdomain,title=excluded.title, \
                      enabled=excluded.enabled,promptable=excluded.promptable, \
                      activation=excluded.activation,priority=excluded.priority, \
-                     values_json=excluded.values_json,x=excluded.x,y=excluded.y",
+                     values_json=excluded.values_json",
                     params![
                         node.id,
                         node.domain_id,
@@ -256,11 +255,126 @@ impl GraphStore {
                         activation_name(node.activation),
                         node.priority,
                         values,
-                        node.x,
-                        node.y
                     ],
                 )
                 .map_err(|error| format!("cannot save node {}: {error}", node.id))?;
+            Ok(())
+        })
+    }
+
+    pub fn save_positions(&self, positions: &[GraphPosition]) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "graph store lock is poisoned".to_owned())?;
+        let mut seen = HashSet::with_capacity(positions.len());
+        let mut changed = Vec::new();
+        for position in positions {
+            check_id(&position.id, "node ID")?;
+            if !position.x.is_finite() || !position.y.is_finite() {
+                return Err(format!("node {} has non-finite coordinates", position.id));
+            }
+            if !seen.insert(position.id.as_str()) {
+                return Err(format!("duplicate node position {}", position.id));
+            }
+            state
+                .snapshot
+                .nodes
+                .binary_search_by(|node| node.id.as_str().cmp(&position.id))
+                .map_err(|_| format!("unknown graph node {}", position.id))?;
+            let saved = state
+                .snapshot
+                .positions
+                .binary_search_by(|saved| saved.id.as_str().cmp(&position.id))
+                .ok()
+                .map(|index| &state.snapshot.positions[index]);
+            if saved != Some(position) {
+                changed.push(position);
+            }
+        }
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let transaction = state
+            .database
+            .transaction()
+            .map_err(|error| format!("cannot start position edit: {error}"))?;
+        for position in &changed {
+            transaction
+                .execute(
+                    "INSERT INTO node_positions (id,x,y) VALUES (?1,?2,?3) \
+                     ON CONFLICT(id) DO UPDATE SET x=excluded.x,y=excluded.y",
+                    params![position.id, position.x, position.y],
+                )
+                .map_err(|error| format!("cannot save position {}: {error}", position.id))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("cannot commit position edit: {error}"))?;
+        for position in changed {
+            match state
+                .snapshot
+                .positions
+                .binary_search_by(|saved| saved.id.cmp(&position.id))
+            {
+                Ok(index) => state.snapshot.positions[index] = position.clone(),
+                Err(index) => state.snapshot.positions.insert(index, position.clone()),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn patch_node_state(&self, patch: &GraphNodeStatePatch) -> Result<(), String> {
+        if patch.ids.is_empty() {
+            return Err("node state patch needs at least one ID".into());
+        }
+        if patch.enabled.is_none() && patch.domain_id.is_none() {
+            return Err("node state patch has no changes".into());
+        }
+        if let Some(domain_id) = &patch.domain_id {
+            check_id(domain_id, "node domain ID")?;
+        }
+        let mut seen = HashSet::with_capacity(patch.ids.len());
+        for id in &patch.ids {
+            check_id(id, "node ID")?;
+            if !seen.insert(id.as_str()) {
+                return Err(format!("duplicate node ID {id}"));
+            }
+        }
+        self.edit(|transaction| {
+            if let Some(domain_id) = &patch.domain_id {
+                let exists: i64 = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM domains WHERE id=?1)",
+                        [domain_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| format!("cannot inspect domain {domain_id}: {error}"))?;
+                if exists == 0 {
+                    return Err(format!("unknown graph domain {domain_id}"));
+                }
+            }
+            for id in &patch.ids {
+                let updated = match (patch.enabled, patch.domain_id.as_deref()) {
+                    (Some(enabled), Some(domain_id)) => transaction.execute(
+                        "UPDATE nodes SET enabled=?1,domain_id=?2 WHERE id=?3",
+                        params![enabled, domain_id, id],
+                    ),
+                    (Some(enabled), None) => transaction.execute(
+                        "UPDATE nodes SET enabled=?1 WHERE id=?2",
+                        params![enabled, id],
+                    ),
+                    (None, Some(domain_id)) => transaction.execute(
+                        "UPDATE nodes SET domain_id=?1 WHERE id=?2",
+                        params![domain_id, id],
+                    ),
+                    (None, None) => unreachable!(),
+                }
+                .map_err(|error| format!("cannot update node {id}: {error}"))?;
+                if updated != 1 {
+                    return Err(format!("unknown graph node {id}"));
+                }
+            }
             Ok(())
         })
     }
@@ -416,10 +530,58 @@ pub fn validate_seed_database(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn check_database(database: &Connection) -> Result<(), String> {
-    let version: i64 = database
+fn database_version(database: &Connection) -> Result<i64, String> {
+    database
         .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|error| format!("cannot read corpus database version: {error}"))?;
+        .map_err(|error| format!("cannot read corpus database version: {error}"))
+}
+
+fn migrate_database(database: &mut Connection) -> Result<(), String> {
+    match database_version(database)? {
+        DATABASE_VERSION => return Ok(()),
+        1 => {}
+        version => {
+            return Err(format!(
+                "unsupported corpus database version {version}; expected {DATABASE_VERSION}"
+            ));
+        }
+    }
+    let transaction = database
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("cannot start corpus database migration: {error}"))?;
+    match database_version(&transaction)? {
+        DATABASE_VERSION => return Ok(()),
+        1 => {}
+        version => {
+            return Err(format!(
+                "unsupported corpus database version {version}; expected {DATABASE_VERSION}"
+            ));
+        }
+    }
+    transaction
+        .execute_batch(
+            "CREATE TABLE node_positions (
+                id TEXT PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                x REAL NOT NULL,
+                y REAL NOT NULL
+             ) WITHOUT ROWID;
+             INSERT INTO node_positions (id,x,y) SELECT id,x,y FROM nodes;
+             ALTER TABLE nodes DROP COLUMN x;
+             ALTER TABLE nodes DROP COLUMN y;",
+        )
+        .map_err(|error| format!("cannot migrate corpus database: {error}"))?;
+    transaction
+        .pragma_update(None, "user_version", DATABASE_VERSION)
+        .map_err(|error| format!("cannot set corpus database version: {error}"))?;
+    check_database(&transaction)?;
+    project(&read_snapshot(&transaction)?)?;
+    transaction
+        .commit()
+        .map_err(|error| format!("cannot commit corpus database migration: {error}"))
+}
+
+fn check_database(database: &Connection) -> Result<(), String> {
+    let version = database_version(database)?;
     if version != DATABASE_VERSION {
         return Err(format!(
             "unsupported corpus database version {version}; expected {DATABASE_VERSION}"
@@ -456,7 +618,7 @@ fn read_snapshot(database: &Connection) -> Result<GraphSnapshot, String> {
 
     let mut statement = database
         .prepare(
-            "SELECT id,domain_id,subdomain,title,enabled,promptable,activation,priority,values_json,x,y \
+            "SELECT id,domain_id,subdomain,title,enabled,promptable,activation,priority,values_json \
              FROM nodes ORDER BY id",
         )
         .map_err(|error| format!("cannot read nodes: {error}"))?;
@@ -474,25 +636,12 @@ fn read_snapshot(database: &Connection) -> Result<GraphSnapshot, String> {
                 activation,
                 row.get::<_, i32>(7)?,
                 values,
-                row.get::<_, f32>(9)?,
-                row.get::<_, f32>(10)?,
             ))
         })
         .map_err(|error| format!("cannot query nodes: {error}"))?;
     for row in rows {
-        let (
-            id,
-            domain_id,
-            subdomain,
-            title,
-            enabled,
-            promptable,
-            activation,
-            priority,
-            values,
-            x,
-            y,
-        ) = row.map_err(|error| format!("invalid node row: {error}"))?;
+        let (id, domain_id, subdomain, title, enabled, promptable, activation, priority, values) =
+            row.map_err(|error| format!("invalid node row: {error}"))?;
         snapshot.nodes.push(GraphNode {
             id,
             domain_id,
@@ -504,9 +653,34 @@ fn read_snapshot(database: &Connection) -> Result<GraphSnapshot, String> {
             priority,
             values: serde_json::from_str(&values)
                 .map_err(|error| format!("invalid node values: {error}"))?,
-            x,
-            y,
         });
+    }
+
+    let mut statement = database
+        .prepare("SELECT id,x,y FROM node_positions ORDER BY id")
+        .map_err(|error| format!("cannot read node positions: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(GraphPosition {
+                id: row.get(0)?,
+                x: row.get(1)?,
+                y: row.get(2)?,
+            })
+        })
+        .map_err(|error| format!("cannot query node positions: {error}"))?;
+    for row in rows {
+        let position = row.map_err(|error| format!("invalid node position: {error}"))?;
+        if !position.x.is_finite() || !position.y.is_finite() {
+            return Err(format!("node {} has non-finite coordinates", position.id));
+        }
+        if snapshot
+            .nodes
+            .binary_search_by(|node| node.id.cmp(&position.id))
+            .is_err()
+        {
+            return Err(format!("position has no graph node {}", position.id));
+        }
+        snapshot.positions.push(position);
     }
 
     let mut statement = database
@@ -564,9 +738,6 @@ fn project(snapshot: &GraphSnapshot) -> Result<GraphProjection, String> {
             ordered_values: node.values.clone(),
         }
         .validate(&format!("node {}", node.id))?;
-        if !node.x.is_finite() || !node.y.is_finite() {
-            return Err(format!("node {} has non-finite coordinates", node.id));
-        }
         if !domains.contains_key(node.domain_id.as_str()) {
             return Err(format!("node {} has no domain {}", node.id, node.domain_id));
         }
@@ -750,18 +921,6 @@ fn normalized_values(values: &[String]) -> String {
         .map(|value| value.trim().to_lowercase())
         .collect::<Vec<_>>()
         .join("\u{1f}")
-}
-
-fn same_inference_fields(left: &GraphNode, right: &GraphNode) -> bool {
-    left.id == right.id
-        && left.domain_id == right.domain_id
-        && left.subdomain == right.subdomain
-        && left.title == right.title
-        && left.enabled == right.enabled
-        && left.promptable == right.promptable
-        && left.activation == right.activation
-        && left.priority == right.priority
-        && left.values == right.values
 }
 
 fn dedup_sources<'a>(sources: &mut Vec<&'a GraphNode>, normalized: &HashMap<&str, String>) {

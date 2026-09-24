@@ -6,10 +6,10 @@ use reqwest::StatusCode;
 pub use xr_corpus_protocol as protocol;
 use xr_corpus_protocol::{
     API_VERSION, CreateSessionRequest, CreateSessionResponse, ErrorResponse, GraphDomain,
-    GraphEdge, GraphNode, GraphSnapshot, HealthResponse, PrepareAsrRequest, PrepareAsrResponse,
-    PrepareTranslationRequest, PrepareTranslationResponse, ProviderSnapshotResponse,
-    PublishProviderRequest, RecordTranslationRequest, RecordTranslationResponse,
-    SessionStateResponse, VrcxStatusResponse,
+    GraphEdge, GraphNode, GraphNodeStatePatch, GraphPosition, GraphSnapshot, HealthResponse,
+    PrepareAsrRequest, PrepareAsrResponse, PrepareTranslationRequest, PrepareTranslationResponse,
+    ProviderSnapshotResponse, PublishProviderRequest, RecordTranslationRequest,
+    RecordTranslationResponse, SessionStateResponse, VrcxStatusResponse,
 };
 
 pub type CorpusResult<T> = Result<T, CorpusClientError>;
@@ -143,22 +143,32 @@ impl CorpusClient {
     }
 
     pub async fn save_domain(&self, domain: &GraphDomain) -> CorpusResult<GraphSnapshot> {
-        self.put(&format!("/v1/graph/domains/{}", domain.id), domain)
+        self.put(&graph_item_path("domains", &domain.id), domain)
             .await
     }
 
     pub async fn remove_domain(&self, id: &str) -> CorpusResult<GraphSnapshot> {
-        self.delete_graph(&format!("/v1/graph/domains/{id}"), None::<&GraphEdge>)
+        self.delete_graph(&graph_item_path("domains", id), None::<&GraphEdge>)
             .await
     }
 
     pub async fn save_node(&self, node: &GraphNode) -> CorpusResult<GraphSnapshot> {
-        self.put(&format!("/v1/graph/nodes/{}", node.id), node)
-            .await
+        self.put(&graph_item_path("nodes", &node.id), node).await
+    }
+
+    pub async fn save_positions(&self, positions: &[GraphPosition]) -> CorpusResult<GraphSnapshot> {
+        self.put("/v1/graph/positions", &positions).await
+    }
+
+    pub async fn patch_node_state(
+        &self,
+        patch: &GraphNodeStatePatch,
+    ) -> CorpusResult<GraphSnapshot> {
+        self.put("/v1/graph/nodes", patch).await
     }
 
     pub async fn remove_node(&self, id: &str) -> CorpusResult<GraphSnapshot> {
-        self.delete_graph(&format!("/v1/graph/nodes/{id}"), None::<&GraphEdge>)
+        self.delete_graph(&graph_item_path("nodes", id), None::<&GraphEdge>)
             .await
     }
 
@@ -381,6 +391,14 @@ fn provider_path(provider_id: &str) -> CorpusResult<String> {
         ));
     }
     Ok(format!("/v1/providers/{provider_id}"))
+}
+
+fn graph_item_path(kind: &str, id: &str) -> String {
+    let mut url = reqwest::Url::parse("http://localhost/v1/graph").expect("fixed graph URL");
+    url.path_segments_mut()
+        .expect("graph URL supports path segments")
+        .extend([kind, id]);
+    url.path().to_owned()
 }
 
 #[cfg(test)]
