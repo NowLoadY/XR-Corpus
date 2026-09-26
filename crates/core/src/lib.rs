@@ -317,6 +317,18 @@ impl DynamicCorpusSource {
             .remove(provider_id);
         Ok(())
     }
+    pub fn snapshot_with_providers(&self) -> Result<Vec<(String, Vec<CorpusDefinition>)>, String> {
+        let now = Instant::now();
+        let mut snapshots = self
+            .snapshots
+            .write()
+            .map_err(|_| "dynamic corpus registry lock is poisoned".to_owned())?;
+        snapshots.retain(|_, snapshot| snapshot.expires_at.is_none_or(|expiry| expiry > now));
+        Ok(snapshots
+            .iter()
+            .map(|(provider_id, snapshot)| (provider_id.clone(), snapshot.corpora.clone()))
+            .collect())
+    }
 }
 
 impl CorpusSource for DynamicCorpusSource {
@@ -336,6 +348,45 @@ impl CorpusSource for DynamicCorpusSource {
             .flat_map(|snapshot| snapshot.corpora.iter().cloned())
             .collect())
     }
+}
+
+fn is_corpus_disabled(
+    disabled: &HashSet<String>,
+    source_id: &str,
+    provider_id: Option<&str>,
+    corpus: &CorpusDefinition,
+) -> bool {
+    if disabled.is_empty() {
+        return false;
+    }
+    if disabled.contains(source_id) {
+        return true;
+    }
+    if let Some(provider) = provider_id {
+        if disabled.contains(provider) {
+            return true;
+        }
+    }
+    if disabled.contains(&corpus.domain) {
+        return true;
+    }
+    if !corpus.subdomain.is_empty() {
+        if disabled.contains(&corpus.subdomain) {
+            return true;
+        }
+        let hierarchical = format!("{}.{}", corpus.domain, corpus.subdomain);
+        if disabled.contains(&hierarchical) {
+            return true;
+        }
+    }
+    for disabled_domain in disabled {
+        if corpus.id == *disabled_domain
+            || corpus.id.starts_with(&format!("{disabled_domain}."))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Read-optimized aggregation of immutable static sources and a shared dynamic
@@ -380,15 +431,25 @@ impl CorpusCatalog {
             .map(GraphStore::projection)
             .transpose()?
             .map_or_else(HashSet::new, |view| view.disabled_domains.clone());
-        Ok(self
-            .dynamic
-            .snapshot()?
-            .into_iter()
-            .filter(|corpus| {
-                corpus.activation == CorpusActivation::Always && !disabled.contains(&corpus.domain)
-            })
-            .flat_map(|corpus| corpus.terms)
-            .collect())
+        let mut terms = Vec::new();
+        for (provider_id, corpora) in self.dynamic.snapshot_with_providers()? {
+            if disabled.contains(&provider_id) {
+                continue;
+            }
+            for corpus in corpora {
+                if corpus.activation == CorpusActivation::Always
+                    && !is_corpus_disabled(
+                        &disabled,
+                        "runtime-dynamic",
+                        Some(&provider_id),
+                        &corpus,
+                    )
+                {
+                    terms.extend(corpus.terms);
+                }
+            }
+        }
+        Ok(terms)
     }
 
     pub fn snapshot(&self) -> Result<Vec<CorpusDefinition>, String> {
@@ -413,21 +474,52 @@ impl CorpusCatalog {
             HashSet::new()
         };
         for source in self.sources.iter() {
-            for corpus in source.snapshot()? {
-                if disabled.contains(&corpus.domain) {
+            if source.source_id() == "runtime-dynamic" {
+                for (provider_id, corpora) in self.dynamic.snapshot_with_providers()? {
+                    if disabled.contains(&provider_id) {
+                        continue;
+                    }
+                    for corpus in corpora {
+                        if is_corpus_disabled(
+                            &disabled,
+                            "runtime-dynamic",
+                            Some(&provider_id),
+                            &corpus,
+                        ) {
+                            continue;
+                        }
+                        corpus.validate()?;
+                        if let Some(previous) =
+                            owners.insert(corpus.id.clone(), format!("dynamic:{provider_id}"))
+                        {
+                            return Err(format!(
+                                "duplicate corpus ID {} from sources {previous:?} and dynamic:{provider_id:?}",
+                                corpus.id
+                            ));
+                        }
+                        all.push(corpus);
+                    }
+                }
+            } else {
+                if disabled.contains(source.source_id()) {
                     continue;
                 }
-                corpus.validate()?;
-                if let Some(previous) =
-                    owners.insert(corpus.id.clone(), source.source_id().to_owned())
-                {
-                    return Err(format!(
-                        "duplicate corpus ID {} from sources {previous:?} and {:?}",
-                        corpus.id,
-                        source.source_id()
-                    ));
+                for corpus in source.snapshot()? {
+                    if is_corpus_disabled(&disabled, source.source_id(), None, &corpus) {
+                        continue;
+                    }
+                    corpus.validate()?;
+                    if let Some(previous) =
+                        owners.insert(corpus.id.clone(), source.source_id().to_owned())
+                    {
+                        return Err(format!(
+                            "duplicate corpus ID {} from sources {previous:?} and {:?}",
+                            corpus.id,
+                            source.source_id()
+                        ));
+                    }
+                    all.push(corpus);
                 }
-                all.push(corpus);
             }
         }
         all.sort_by(|left, right| left.id.cmp(&right.id));
@@ -504,4 +596,236 @@ fn valid_provider_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_term(val: &str) -> CorpusTerm {
+        CorpusTerm::from_ordered(vec![val.to_owned(); CORPUS_LANGUAGE_ORDER.len()]).unwrap()
+    }
+
+    fn sample_corpus(id: &str, domain: &str, subdomain: &str) -> CorpusDefinition {
+        CorpusDefinition {
+            schema: CORPUS_SCHEMA.into(),
+            id: id.into(),
+            domain: domain.into(),
+            subdomain: subdomain.into(),
+            title: id.into(),
+            priority: 100,
+            activation: CorpusActivation::Always,
+            triggers: Vec::new(),
+            trigger_aliases: Vec::new(),
+            activation_context: Vec::new(),
+            terms: vec![sample_term("VRChat"), sample_term("VRC")],
+        }
+    }
+
+    #[test]
+    fn test_is_corpus_disabled_by_provider() {
+        let mut disabled = HashSet::new();
+        disabled.insert("vrcx".to_string());
+
+        let corpus = sample_corpus(
+            "virtual-worlds.vrchat.runtime-game-mode",
+            "virtual-worlds",
+            "vrchat",
+        );
+
+        // When provider is vrcx and vrcx is disabled:
+        assert!(is_corpus_disabled(
+            &disabled,
+            "runtime-dynamic",
+            Some("vrcx"),
+            &corpus
+        ));
+
+        // When provider is something else:
+        assert!(!is_corpus_disabled(
+            &disabled,
+            "runtime-dynamic",
+            Some("other"),
+            &corpus
+        ));
+    }
+
+    #[test]
+    fn test_is_corpus_disabled_by_subdomain_and_hierarchical() {
+        let mut disabled = HashSet::new();
+        disabled.insert("virtual-worlds.vrchat".to_string());
+
+        let corpus = sample_corpus(
+            "virtual-worlds.vrchat.runtime-game-mode",
+            "virtual-worlds",
+            "vrchat",
+        );
+
+        // Disabling child domain "virtual-worlds.vrchat" must disable this corpus:
+        assert!(is_corpus_disabled(
+            &disabled,
+            "runtime-dynamic",
+            Some("other"),
+            &corpus
+        ));
+    }
+
+    #[test]
+    fn test_is_corpus_disabled_by_root_domain() {
+        let mut disabled = HashSet::new();
+        disabled.insert("virtual-worlds".to_string());
+
+        let corpus = sample_corpus(
+            "virtual-worlds.vrchat.runtime-game-mode",
+            "virtual-worlds",
+            "vrchat",
+        );
+
+        assert!(is_corpus_disabled(
+            &disabled,
+            "runtime-dynamic",
+            Some("other"),
+            &corpus
+        ));
+    }
+
+    #[test]
+    fn test_catalog_filters_dynamic_vrcx_when_disabled() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "xr_corpus_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let db_path = temp_dir.join("test.sqlite");
+        let seed_path = temp_dir.join("seed.sqlite");
+
+        {
+            let conn = rusqlite::Connection::open(&seed_path).unwrap();
+            conn.pragma_update(None, "user_version", 4).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE domains (id TEXT PRIMARY KEY, title TEXT NOT NULL, enabled INTEGER NOT NULL, parent_id TEXT);
+                 CREATE TABLE nodes (id TEXT PRIMARY KEY, domain_id TEXT NOT NULL, title TEXT NOT NULL, enabled INTEGER NOT NULL, promptable INTEGER NOT NULL, activation TEXT NOT NULL, priority INTEGER NOT NULL, values_json TEXT NOT NULL);
+                 CREATE TABLE edges (source_id TEXT NOT NULL, target_id TEXT NOT NULL, kind TEXT NOT NULL, enabled INTEGER NOT NULL, PRIMARY KEY(source_id, target_id, kind));"
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO domains (id, title, enabled, parent_id) VALUES ('vrcx', 'VRCX', 0, NULL)",
+                [],
+            ).unwrap();
+        }
+
+        let graph = GraphStore::open(&db_path, &seed_path).unwrap();
+        let dynamic = DynamicCorpusSource::default();
+        let catalog = CorpusCatalog::from_sources_with_dynamic(
+            Vec::new(),
+            dynamic.clone(),
+            Some(graph),
+        ).unwrap();
+
+        let game_mode = sample_corpus(
+            "virtual-worlds.vrchat.runtime-game-mode",
+            "virtual-worlds",
+            "vrchat",
+        );
+        dynamic.replace_snapshot("vrcx", vec![game_mode.clone()], None).unwrap();
+
+        let (corpora, _) = catalog.snapshot_with_revision().unwrap();
+        assert!(
+            corpora.is_empty(),
+            "expected dynamic vrcx corpora to be filtered out when vrcx domain is disabled"
+        );
+
+        let terms = catalog.runtime_activation_terms().unwrap();
+        assert!(
+            terms.is_empty(),
+            "expected runtime activation terms to be filtered out when vrcx domain is disabled"
+        );
+
+        // Now test disabling virtual-worlds.vrchat child domain while vrcx is enabled
+        let db_path2 = temp_dir.join("test2.sqlite");
+        let seed_path2 = temp_dir.join("seed2.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&seed_path2).unwrap();
+            conn.pragma_update(None, "user_version", 4).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE domains (id TEXT PRIMARY KEY, title TEXT NOT NULL, enabled INTEGER NOT NULL, parent_id TEXT);
+                 CREATE TABLE nodes (id TEXT PRIMARY KEY, domain_id TEXT NOT NULL, title TEXT NOT NULL, enabled INTEGER NOT NULL, promptable INTEGER NOT NULL, activation TEXT NOT NULL, priority INTEGER NOT NULL, values_json TEXT NOT NULL);
+                 CREATE TABLE edges (source_id TEXT NOT NULL, target_id TEXT NOT NULL, kind TEXT NOT NULL, enabled INTEGER NOT NULL, PRIMARY KEY(source_id, target_id, kind));"
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO domains (id, title, enabled, parent_id) VALUES ('virtual-worlds', 'Virtual Worlds', 1, NULL)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO domains (id, title, enabled, parent_id) VALUES ('virtual-worlds.vrchat', 'VRChat', 0, 'virtual-worlds')",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO domains (id, title, enabled, parent_id) VALUES ('vrcx', 'VRCX', 1, NULL)",
+                [],
+            ).unwrap();
+        }
+
+        let graph2 = GraphStore::open(&db_path2, &seed_path2).unwrap();
+        let dynamic2 = DynamicCorpusSource::default();
+        let catalog2 = CorpusCatalog::from_sources_with_dynamic(
+            Vec::new(),
+            dynamic2.clone(),
+            Some(graph2),
+        ).unwrap();
+        dynamic2.replace_snapshot("vrcx", vec![game_mode.clone()], None).unwrap();
+
+        let (corpora2, _) = catalog2.snapshot_with_revision().unwrap();
+        assert!(
+            corpora2.is_empty(),
+            "expected game_mode to be filtered out when virtual-worlds.vrchat is disabled"
+        );
+
+        // When everything is enabled, game_mode should be present
+        let db_path3 = temp_dir.join("test3.sqlite");
+        let seed_path3 = temp_dir.join("seed3.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&seed_path3).unwrap();
+            conn.pragma_update(None, "user_version", 4).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE domains (id TEXT PRIMARY KEY, title TEXT NOT NULL, enabled INTEGER NOT NULL, parent_id TEXT);
+                 CREATE TABLE nodes (id TEXT PRIMARY KEY, domain_id TEXT NOT NULL, title TEXT NOT NULL, enabled INTEGER NOT NULL, promptable INTEGER NOT NULL, activation TEXT NOT NULL, priority INTEGER NOT NULL, values_json TEXT NOT NULL);
+                 CREATE TABLE edges (source_id TEXT NOT NULL, target_id TEXT NOT NULL, kind TEXT NOT NULL, enabled INTEGER NOT NULL, PRIMARY KEY(source_id, target_id, kind));"
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO domains (id, title, enabled, parent_id) VALUES ('virtual-worlds', 'Virtual Worlds', 1, NULL)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO domains (id, title, enabled, parent_id) VALUES ('virtual-worlds.vrchat', 'VRChat', 1, 'virtual-worlds')",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO domains (id, title, enabled, parent_id) VALUES ('vrcx', 'VRCX', 1, NULL)",
+                [],
+            ).unwrap();
+        }
+
+        let graph3 = GraphStore::open(&db_path3, &seed_path3).unwrap();
+        let dynamic3 = DynamicCorpusSource::default();
+        let catalog3 = CorpusCatalog::from_sources_with_dynamic(
+            Vec::new(),
+            dynamic3.clone(),
+            Some(graph3),
+        ).unwrap();
+        dynamic3.replace_snapshot("vrcx", vec![game_mode], None).unwrap();
+
+        let (corpora3, _) = catalog3.snapshot_with_revision().unwrap();
+        assert_eq!(
+            corpora3.len(),
+            1,
+            "expected game_mode to be included when both vrcx and virtual-worlds.vrchat are enabled"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
