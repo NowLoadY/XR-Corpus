@@ -462,14 +462,14 @@ fn publish_seed(temporary: &Path, runtime_db: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn publish_seed_without_hard_links(temporary: &Path, runtime_db: &Path) -> io::Result<()> {
     use rustix::fs::{CWD, RenameFlags, renameat_with};
 
     renameat_with(CWD, temporary, CWD, runtime_db, RenameFlags::NOREPLACE).map_err(io::Error::from)
 }
 
-#[cfg(all(not(windows), not(target_os = "linux")))]
+#[cfg(all(not(windows), not(any(target_os = "linux", target_os = "android"))))]
 fn publish_seed_without_hard_links(_temporary: &Path, _runtime_db: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
