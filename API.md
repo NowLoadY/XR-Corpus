@@ -40,6 +40,13 @@ Do not branch on the English `error` text.
    recognition metadata used to label dialogue context.
 6. `DELETE /v2/sessions/{id}` when finished. Abandoned sessions expire automatically.
 
+The Rust SDK's `prepare_asr` takes a mutable session handle. If the server reports
+HTTP 404 with `session_not_found`, it creates a fresh session and retries this
+preparation once. Retain that handle for later turns. Clones already handed to
+in-flight work keep the old session identity; translation and result requests are
+never replayed into a new session with stale context IDs. Expired conversation
+history is not restored. Other errors are returned without retrying.
+
 `GET /v2/sessions/{id}` exposes active corpus IDs and retained snapshot count for diagnostics.
 Snapshots are immutable and bounded; clients must not reuse old context IDs indefinitely.
 

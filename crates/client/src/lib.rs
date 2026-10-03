@@ -266,12 +266,24 @@ impl CorpusSessionClient {
     }
 
     pub async fn prepare_asr(
-        &self,
+        &mut self,
         request: &PrepareAsrRequest,
     ) -> CorpusResult<PrepareAsrResponse> {
-        self.client
+        let result = self
+            .client
             .post(&format!("/v2/sessions/{}/asr", self.session_id), request)
-            .await
+            .await;
+        if matches!(&result, Err(CorpusClientError::Server { status: 404, code, .. }) if code == "session_not_found")
+        {
+            // Start a fresh turn after idle expiry. Existing clones retain the
+            // old identity so in-flight results never enter the new session.
+            *self = self.client.create_session().await?;
+            return self
+                .client
+                .post(&format!("/v2/sessions/{}/asr", self.session_id), request)
+                .await;
+        }
+        result
     }
 
     pub async fn prepare_translation(
@@ -400,6 +412,129 @@ fn graph_item_path(kind: &str, id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, Read, Write};
+
+    fn session_server(
+        replies: Vec<(&'static str, u16, &'static str)>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            for (expected, status, body) in replies {
+                let (socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(socket);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line.trim_end(), format!("{expected} HTTP/1.1"));
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                reader.read_exact(&mut vec![0; length]).unwrap();
+                write!(reader.get_mut(), "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        (url, worker)
+    }
+
+    fn asr_request() -> PrepareAsrRequest {
+        PrepareAsrRequest {
+            source_language: "en".into(),
+            target_language: "zh".into(),
+            budgets: protocol::ContextBudgets {
+                asr_tokens: 128,
+                translation_tokens: 256,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_session_recovers_once_and_retains_the_new_identity_for_later_turns() {
+        let (url, server) = session_server(vec![
+            ("POST /v2/sessions", 200, r#"{"session_id":"old"}"#),
+            (
+                "POST /v2/sessions/old/asr",
+                404,
+                r#"{"code":"session_not_found","error":"expired"}"#,
+            ),
+            ("POST /v2/sessions", 200, r#"{"session_id":"new"}"#),
+            ("POST /v2/sessions/new/asr", 200, r#"{"context_id":1}"#),
+            ("POST /v2/sessions/new/asr", 200, r#"{"context_id":2}"#),
+            ("DELETE /v2/sessions/old", 404, ""),
+            ("DELETE /v2/sessions/new", 204, ""),
+        ]);
+        let mut session = CorpusClient::new(url)
+            .unwrap()
+            .create_session()
+            .await
+            .unwrap();
+        let in_flight = session.clone();
+        assert_eq!(
+            session
+                .prepare_asr(&asr_request())
+                .await
+                .unwrap()
+                .context_id,
+            1
+        );
+        assert_eq!(session.id(), "new");
+        assert_eq!(
+            session
+                .prepare_asr(&asr_request())
+                .await
+                .unwrap()
+                .context_id,
+            2
+        );
+        assert_eq!(in_flight.id(), "old");
+        in_flight.close().await.unwrap();
+        session.close().await.unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_recovery_is_bounded_and_does_not_mask_other_errors() {
+        for (status, code) in [
+            (404, "session_not_found"),
+            (404, "other"),
+            (500, "session_not_found"),
+        ] {
+            let body = match code {
+                "other" => r#"{"code":"other","error":"unavailable"}"#,
+                _ => r#"{"code":"session_not_found","error":"unavailable"}"#,
+            };
+            let mut replies = vec![
+                ("POST /v2/sessions", 200, r#"{"session_id":"old"}"#),
+                ("POST /v2/sessions/old/asr", status, body),
+            ];
+            if status == 404 && code == "session_not_found" {
+                replies.extend([
+                    ("POST /v2/sessions", 200, r#"{"session_id":"new"}"#),
+                    ("POST /v2/sessions/new/asr", status, body),
+                ]);
+            }
+            let (url, server) = session_server(replies);
+            let mut session = CorpusClient::new(url)
+                .unwrap()
+                .create_session()
+                .await
+                .unwrap();
+            assert!(matches!(session.prepare_asr(&asr_request()).await,
+                Err(CorpusClientError::Server { status: actual_status, code: actual_code, .. })
+                if actual_status == status && actual_code == code));
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn base_url_is_validated_before_any_network_request() {

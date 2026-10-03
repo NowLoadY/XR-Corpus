@@ -33,7 +33,7 @@ Start integrations with the typed Rust client:
 
 ```rust
 let corpus = xr_corpus_client::CorpusClient::connect("http://127.0.0.1:7766").await?;
-let session = corpus.create_session().await?;
+let mut session = corpus.create_session().await?;
 ```
 
 `connect` verifies API compatibility before returning. See [API.md](API.md) for the complete
