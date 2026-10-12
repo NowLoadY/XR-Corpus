@@ -57,13 +57,22 @@ and `edges`. Node positions are arranged automatically by the client and are
 not stored in the corpus database.
 Changes take effect in new ASR and translation selections without restarting the service.
 
-- `PUT /v2/graph/domains/{id}` saves a domain with an optional `parent_id` (`null` for a root);
+- `PUT /v2/graph/domains/{id}` saves a domain with an optional `parent_id` (`null` for a root)
+  and `cue_words`: `null` inherits the nearest ancestor's rules, `[]` uses direct matching,
+  and a nonempty list activates the domain when any topic word occurs, in any language.
+  Optional `inherit_existing: true` makes all terms in this domain and its descendants
+  use their domain rules, in the same transaction. Descendants' explicit domain rules remain in place;
   `DELETE` removes a domain only when it has no nodes or children.
 - `PUT /v2/graph/nodes/{id}` saves a node; `DELETE` removes a node but leaves its edges
   dormant so they can reconnect if that ID appears again.
-- `PUT /v2/graph/nodes` updates `enabled` and/or `domain_id` for a nonempty
+- `PUT /v2/graph/nodes` updates `enabled`, `domain_id`, and/or `inherit_domain` for a nonempty
   `ids` array in one transaction. Unknown or duplicate IDs and unknown domains reject
   the entire batch.
+- `PUT /v2/graph/terms/{id}` atomically saves `{node, domain, incoming_edges}`.
+  `domain` is an optional new domain containing the term; an existing domain ID is rejected.
+  `incoming_edges` replaces that term's incoming edges only. Failure rolls back the entire edit.
+- `POST /v2/graph/terms` imports an array of nodes in one transaction, with a 32 MiB request limit.
+  Existing or repeated IDs reject the whole batch; existing terms are never overwritten.
 - `PUT /v2/graph/edges` saves an edge; `DELETE /v2/graph/edges` with the edge as JSON
   removes it.
 
@@ -71,17 +80,33 @@ Mutations return the current complete graph. IDs in URL paths must match the JSO
 Nodes belong to one domain in the tree and require exactly sixteen ordered language values.
 The runtime corpus `subdomain` is derived from the first child below the root domain. `activation`
 is `always` or `on-evidence`; `promptable` controls whether a node can enter recognition
-and translation context. An `on-evidence` node needs an enabled incoming `trigger` edge.
+and translation context. A node with `inherit_domain: true` uses the effective domain rules
+instead of its individual activation or incoming edges. Moving it changes its inherited rules.
+`recognition_aliases` belongs to the term independently: a map of language codes to spellings,
+for example `{"en":["fanboy","fem boy"]}` on a term whose English value is `femboy`.
+Every populated alias language needs a canonical value in that same language. Saving trims and
+deduplicates spellings; aliases never become hotwords or bypass domain activation. Changing
+inheritance, moving terms, or applying domain rules preserves aliases. An empty map removes them.
+The editor defaults new and imported terms to inheritance. Omitted `inherit_domain` is `false`
+for compatibility with existing clients. Existing stored nodes keep their individual rules on upgrade.
+An independent `on-evidence` node needs an enabled incoming `trigger` edge.
 Incoming `context` edges express a second requirement: one enabled context source must also
 appear in the current evidence. Both endpoint nodes and every ancestor domain must be enabled.
 An edge whose source or target does not exist remains stored and becomes effective when
 that node appears again. The graph editor visualizes these edges as dormant.
 
+Inherited terms are compiled into shared domain/priority collections, without generating edges
+between their members. A domain may contain more than the 512-term limit used for external provider
+payloads. Topic words enter activation through `topic_words` only; they are never offered as
+translations or recognition corrections. Prompt vocabulary remains relevance- and budget-limited.
+
 The database is `runtime/xr-corpus.sqlite`, initialized once from the packaged
 `corpora/default.sqlite`. Stop XRTranslate before copying the user database to another
 installation. The service keeps the user database across ordinary application updates.
 When the database format changes, it migrates the existing runtime database in one
-transaction before opening it.
+transaction before opening it. Schema v6 adds per-term recognition aliases and migrates enabled alias-node corrections;
+v3/v4/v5 user databases migrate transactionally. Existing activation edges remain intact.
+The v4/v5 distribution seeds are accepted without modification.
 
 ## Runtime providers
 
@@ -130,3 +155,14 @@ remain empty columns. The Rust types validate schema IDs, column count, limits, 
 - Session history and context snapshots are bounded.
 - Prompt budgets come from the active ASR and translation models, not hard-coded model names.
 - Persistent graph nodes and dynamic providers enter the same ranking and activation pipeline.
+
+### Recognition alias provider compatibility
+
+Runtime corpora may supply `recognition_aliases` as
+`[{"language":"en","canonical":"femboy","variants":["fanboy"]}]`.
+The canonical word must occur in the corpus terminology. An explicit empty array disables
+correction aliases; omission preserves the legacy `trigger_aliases` interpretation. Persisted
+graph projections always provide this field, so removing a migrated alias cannot resurrect it
+through old activation edges. Activation topics, canonical hotwords and correction spellings
+remain separate. Ambiguous active mappings are not applied. ASR and translation response
+contracts are unchanged.

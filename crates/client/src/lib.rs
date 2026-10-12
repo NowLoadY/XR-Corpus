@@ -5,9 +5,9 @@ use std::time::Duration;
 use reqwest::StatusCode;
 pub use xr_corpus_protocol as protocol;
 use xr_corpus_protocol::{
-    API_VERSION, CreateSessionRequest, CreateSessionResponse, ErrorResponse, GraphDomain,
-    GraphEdge, GraphNode, GraphNodeStatePatch, GraphSnapshot, HealthResponse, PrepareAsrRequest,
-    PrepareAsrResponse, PrepareTranslationRequest, PrepareTranslationResponse,
+    API_VERSION, CreateSessionRequest, CreateSessionResponse, ErrorResponse, GraphDomain, GraphDomainEdit,
+    GraphEdge, GraphNode, GraphNodeStatePatch, GraphSnapshot, GraphTermEdit, HealthResponse,
+    PrepareAsrRequest, PrepareAsrResponse, PrepareTranslationRequest, PrepareTranslationResponse,
     ProviderSnapshotResponse, PublishProviderRequest, RecordTranslationRequest,
     RecordTranslationResponse, SessionStateResponse, VrcxStatusResponse,
 };
@@ -66,6 +66,7 @@ pub struct CorpusClient {
 pub struct CorpusSessionClient {
     client: CorpusClient,
     session_id: String,
+    options: CreateSessionRequest,
 }
 
 impl CorpusClient {
@@ -125,12 +126,19 @@ impl CorpusClient {
     }
 
     pub async fn create_session(&self) -> CorpusResult<CorpusSessionClient> {
-        let response: CreateSessionResponse = self
-            .post("/v2/sessions", &CreateSessionRequest::default())
-            .await?;
+        self.create_session_with_options(CreateSessionRequest::default())
+            .await
+    }
+
+    pub async fn create_session_with_options(
+        &self,
+        options: CreateSessionRequest,
+    ) -> CorpusResult<CorpusSessionClient> {
+        let response: CreateSessionResponse = self.post("/v2/sessions", &options).await?;
         Ok(CorpusSessionClient {
             client: self.clone(),
             session_id: response.session_id,
+            options,
         })
     }
 
@@ -147,8 +155,23 @@ impl CorpusClient {
             .await
     }
 
+    pub async fn save_domain_rules(&self, edit: &GraphDomainEdit) -> CorpusResult<GraphSnapshot> {
+        self.put(&graph_item_path("domains", &edit.domain.id), edit).await
+    }
+
     pub async fn remove_domain(&self, id: &str) -> CorpusResult<GraphSnapshot> {
         self.delete_graph(&graph_item_path("domains", id), None::<&GraphEdge>)
+            .await
+    }
+
+    pub async fn import_terms(&self, nodes: &[GraphNode]) -> CorpusResult<GraphSnapshot> {
+        let response = self.http.post(format!("{}/v2/graph/terms", self.base_url))
+            .timeout(Duration::from_secs(60)).json(nodes).send().await.map_err(request_error)?;
+        decode(response).await
+    }
+
+    pub async fn save_term(&self, edit: &GraphTermEdit) -> CorpusResult<GraphSnapshot> {
+        self.put(&graph_item_path("terms", &edit.node.id), edit)
             .await
     }
 
@@ -277,7 +300,10 @@ impl CorpusSessionClient {
         {
             // Start a fresh turn after idle expiry. Existing clones retain the
             // old identity so in-flight results never enter the new session.
-            *self = self.client.create_session().await?;
+            *self = self
+                .client
+                .create_session_with_options(self.options.clone())
+                .await?;
             return self
                 .client
                 .post(&format!("/v2/sessions/{}/asr", self.session_id), request)

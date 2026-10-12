@@ -1,10 +1,13 @@
 //! Persistent terminology graph and transient runtime corpus snapshots.
 
+mod aliases;
 mod graph;
 
+pub use aliases::{RecognitionAlias, RecognitionAliases};
+
 pub use graph::{
-    GraphDomain, GraphEdge, GraphEdgeKind, GraphNode, GraphNodeStatePatch, GraphSnapshot,
-    GraphStore, validate_seed_database,
+    GraphDomain, GraphDomainEdit, GraphEdge, GraphEdgeKind, GraphNode, GraphNodeStatePatch,
+    GraphSnapshot, GraphStore, GraphTermEdit, validate_seed_database,
 };
 
 use std::{
@@ -189,6 +192,13 @@ pub struct CorpusDefinition {
     pub triggers: Vec<CorpusTerm>,
     #[serde(default)]
     pub trigger_aliases: Vec<CorpusTerm>,
+    /// Explicit corrections, independent of activation. None accepts legacy
+    /// provider aliases; Some(empty) intentionally disables those corrections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recognition_aliases: Option<Vec<RecognitionAlias>>,
+    /// Language-neutral domain evidence; never rendered as terminology or recognition aliases.
+    #[serde(default)]
+    pub topic_words: Vec<String>,
     #[serde(default)]
     pub activation_context: Vec<CorpusTerm>,
     #[serde(default)]
@@ -196,7 +206,21 @@ pub struct CorpusDefinition {
 }
 
 impl CorpusDefinition {
+    pub fn recognition_aliases(&self) -> std::borrow::Cow<'_, [RecognitionAlias]> {
+        match &self.recognition_aliases {
+            Some(aliases) => std::borrow::Cow::Borrowed(aliases),
+            None => std::borrow::Cow::Owned(aliases::legacy_aliases(
+                self.trigger_aliases.iter(),
+                &self.terms,
+            )),
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
+        self.validate_with_term_limit(MAX_TERMS)
+    }
+
+    fn validate_with_term_limit(&self, term_limit: usize) -> Result<(), String> {
         if self.schema != CORPUS_SCHEMA {
             return Err(format!(
                 "corpus {} uses unsupported schema {:?}; expected {CORPUS_SCHEMA}",
@@ -229,11 +253,36 @@ impl CorpusDefinition {
             &self.activation_context,
             MAX_TRIGGERS,
         )?;
-        validate_terms(&self.id, "terms", &self.terms, MAX_TERMS)?;
+        validate_terms(&self.id, "terms", &self.terms, term_limit)?;
+        let aliases = self.recognition_aliases();
+        if !aliases.is_empty() {
+            let canonical: HashSet<_> = self
+                .terms
+                .iter()
+                .flat_map(|term| {
+                    CORPUS_LANGUAGE_ORDER.iter().filter_map(move |language| {
+                        term.value(language).map(|word| (*language, word))
+                    })
+                })
+                .collect();
+            for alias in aliases.iter() {
+                alias.validate()?;
+                if !canonical.contains(&(alias.language.as_str(), alias.canonical.as_str())) {
+                    return Err("recognition alias canonical word must belong to the corpus".into());
+                }
+            }
+        }
+        if self.topic_words.len() > MAX_TRIGGERS {
+            return Err("too many domain topic words (maximum 128)".into());
+        }
+        for word in &self.topic_words {
+            graph::check_cue(word)?;
+        }
         if self.terms.is_empty()
             || (self.activation == CorpusActivation::OnEvidence
                 && self.triggers.is_empty()
-                && self.trigger_aliases.is_empty())
+                && self.trigger_aliases.is_empty()
+                && self.topic_words.is_empty())
         {
             return Err(format!(
                 "corpus {} must contain at least one term, and evidence-activated corpora need at least one trigger",
@@ -380,9 +429,7 @@ fn is_corpus_disabled(
         }
     }
     for disabled_domain in disabled {
-        if corpus.id == *disabled_domain
-            || corpus.id.starts_with(&format!("{disabled_domain}."))
-        {
+        if corpus.id == *disabled_domain || corpus.id.starts_with(&format!("{disabled_domain}.")) {
             return true;
         }
     }
@@ -617,6 +664,8 @@ mod tests {
             activation: CorpusActivation::Always,
             triggers: Vec::new(),
             trigger_aliases: Vec::new(),
+            recognition_aliases: None,
+            topic_words: Vec::new(),
             activation_context: Vec::new(),
             terms: vec![sample_term("VRChat"), sample_term("VRC")],
         }
@@ -720,18 +769,18 @@ mod tests {
 
         let graph = GraphStore::open(&db_path, &seed_path).unwrap();
         let dynamic = DynamicCorpusSource::default();
-        let catalog = CorpusCatalog::from_sources_with_dynamic(
-            Vec::new(),
-            dynamic.clone(),
-            Some(graph),
-        ).unwrap();
+        let catalog =
+            CorpusCatalog::from_sources_with_dynamic(Vec::new(), dynamic.clone(), Some(graph))
+                .unwrap();
 
         let game_mode = sample_corpus(
             "virtual-worlds.vrchat.runtime-game-mode",
             "virtual-worlds",
             "vrchat",
         );
-        dynamic.replace_snapshot("vrcx", vec![game_mode.clone()], None).unwrap();
+        dynamic
+            .replace_snapshot("vrcx", vec![game_mode.clone()], None)
+            .unwrap();
 
         let (corpora, _) = catalog.snapshot_with_revision().unwrap();
         assert!(
@@ -772,12 +821,12 @@ mod tests {
 
         let graph2 = GraphStore::open(&db_path2, &seed_path2).unwrap();
         let dynamic2 = DynamicCorpusSource::default();
-        let catalog2 = CorpusCatalog::from_sources_with_dynamic(
-            Vec::new(),
-            dynamic2.clone(),
-            Some(graph2),
-        ).unwrap();
-        dynamic2.replace_snapshot("vrcx", vec![game_mode.clone()], None).unwrap();
+        let catalog2 =
+            CorpusCatalog::from_sources_with_dynamic(Vec::new(), dynamic2.clone(), Some(graph2))
+                .unwrap();
+        dynamic2
+            .replace_snapshot("vrcx", vec![game_mode.clone()], None)
+            .unwrap();
 
         let (corpora2, _) = catalog2.snapshot_with_revision().unwrap();
         assert!(
@@ -812,12 +861,12 @@ mod tests {
 
         let graph3 = GraphStore::open(&db_path3, &seed_path3).unwrap();
         let dynamic3 = DynamicCorpusSource::default();
-        let catalog3 = CorpusCatalog::from_sources_with_dynamic(
-            Vec::new(),
-            dynamic3.clone(),
-            Some(graph3),
-        ).unwrap();
-        dynamic3.replace_snapshot("vrcx", vec![game_mode], None).unwrap();
+        let catalog3 =
+            CorpusCatalog::from_sources_with_dynamic(Vec::new(), dynamic3.clone(), Some(graph3))
+                .unwrap();
+        dynamic3
+            .replace_snapshot("vrcx", vec![game_mode], None)
+            .unwrap();
 
         let (corpora3, _) = catalog3.snapshot_with_revision().unwrap();
         assert_eq!(

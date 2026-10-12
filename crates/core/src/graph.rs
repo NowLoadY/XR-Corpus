@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CORPUS_SCHEMA, CorpusActivation, CorpusDefinition, CorpusTerm, VRCX_DOMAIN_ID};
 
-const DATABASE_VERSION: i64 = 4;
+const DATABASE_VERSION: i64 = 6;
 static NEXT_SEED_FILE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +23,17 @@ pub struct GraphDomain {
     pub title: String,
     pub enabled: bool,
     pub parent_id: Option<String>,
+    /// None inherits the nearest ancestor; an empty list enables direct matching.
+    #[serde(default)]
+    pub cue_words: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GraphDomainEdit {
+    #[serde(flatten)]
+    pub domain: GraphDomain,
+    #[serde(default)]
+    pub inherit_existing: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -34,8 +45,22 @@ pub struct GraphNode {
     pub enabled: bool,
     pub promptable: bool,
     pub activation: CorpusActivation,
+    #[serde(default)]
+    pub inherit_domain: bool,
     pub priority: i32,
     pub values: Vec<String>,
+    #[serde(default)]
+    pub recognition_aliases: crate::RecognitionAliases,
+}
+
+/// Saves a term and its incoming activation rules as one graph edit.
+/// An optional new domain is created in the same transaction.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphTermEdit {
+    pub node: GraphNode,
+    pub domain: Option<GraphDomain>,
+    pub incoming_edges: Vec<GraphEdge>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +68,8 @@ pub struct GraphNodeStatePatch {
     pub ids: Vec<String>,
     pub enabled: Option<bool>,
     pub domain_id: Option<String>,
+    #[serde(default)]
+    pub inherit_domain: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -191,38 +218,27 @@ impl GraphStore {
     }
 
     pub fn upsert_domain(&self, domain: &GraphDomain) -> Result<(), String> {
-        check_id(&domain.id, "domain ID")?;
-        check_title(&domain.title, "domain title")?;
-        if let Some(parent_id) = &domain.parent_id {
-            check_id(parent_id, "parent domain ID")?;
-        }
-        if domain.id == VRCX_DOMAIN_ID && domain.parent_id.is_some() {
-            return Err("VRCX must remain a root domain".into());
-        }
+        self.edit(|transaction| write_domain(transaction, domain))
+    }
+
+    pub fn save_domain_rules(&self, edit: &GraphDomainEdit) -> Result<(), String> {
         self.edit(|transaction| {
-            transaction
-                .execute(
-                    "INSERT INTO domains (id,title,enabled,parent_id) VALUES (?1,?2,?3,?4) \
-                     ON CONFLICT(id) DO UPDATE SET title=excluded.title, \
-                     enabled=excluded.enabled, parent_id=excluded.parent_id",
-                    params![domain.id, domain.title, domain.enabled, domain.parent_id],
-                )
-                .map_err(|error| format!("cannot save domain {}: {error}", domain.id))?;
+            write_domain(transaction, &edit.domain)?;
+            if edit.inherit_existing {
+                transaction
+                    .execute(
+                        "WITH RECURSIVE subtree(id) AS (SELECT ?1 UNION \
+                     SELECT domains.id FROM domains JOIN subtree ON domains.parent_id=subtree.id) \
+                     UPDATE nodes SET inherit_domain=1 WHERE domain_id IN (SELECT id FROM subtree)",
+                        [&edit.domain.id],
+                    )
+                    .map_err(|error| format!("cannot apply domain rules: {error}"))?;
+            }
             Ok(())
         })
     }
 
     pub fn upsert_node(&self, node: &GraphNode) -> Result<(), String> {
-        check_id(&node.id, "node ID")?;
-        check_id(&node.domain_id, "node domain ID")?;
-        check_title(&node.title, "node title")?;
-        if node.activation == CorpusActivation::RuntimeOnly {
-            return Err("runtime-only activation is reserved for transient providers".into());
-        }
-        CorpusTerm {
-            ordered_values: node.values.clone(),
-        }
-        .validate("graph node")?;
         {
             let state = self
                 .state
@@ -237,31 +253,65 @@ impl GraphStore {
                 return Ok(());
             }
         }
-        let values = serde_json::to_string(&node.values)
-            .map_err(|error| format!("cannot encode node values: {error}"))?;
+        self.edit(|transaction| write_node(transaction, node))
+    }
+
+    pub fn import_terms(&self, nodes: &[GraphNode]) -> Result<(), String> {
+        if nodes.is_empty() {
+            return Err("no terms to import".into());
+        }
         self.edit(|transaction| {
+            for node in nodes {
+                let exists: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1)",
+                        [&node.id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| format!("cannot inspect term: {error}"))?;
+                if exists {
+                    return Err(format!("term {} already exists", node.id));
+                }
+                write_node(transaction, node)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn save_term(&self, edit: &GraphTermEdit) -> Result<(), String> {
+        let mut keys = HashSet::new();
+        for edge in &edit.incoming_edges {
+            if edge.target_id != edit.node.id {
+                return Err("incoming edge must target the edited term".into());
+            }
+            if !keys.insert((&edge.source_id, edge.kind)) {
+                return Err("duplicate incoming edge".into());
+            }
+        }
+        self.edit(|transaction| {
+            if let Some(domain) = &edit.domain {
+                if domain.id != edit.node.domain_id {
+                    return Err("new domain must contain the edited term".into());
+                }
+                let exists: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM domains WHERE id=?1)",
+                        [&domain.id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| format!("cannot inspect domain: {error}"))?;
+                if exists {
+                    return Err("new domain already exists".into());
+                }
+                write_domain(transaction, domain)?;
+            }
+            write_node(transaction, &edit.node)?;
             transaction
-                .execute(
-                    "INSERT INTO nodes \
-                     (id,domain_id,title,enabled,promptable,activation,priority,values_json) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8) \
-                     ON CONFLICT(id) DO UPDATE SET \
-                     domain_id=excluded.domain_id,title=excluded.title, \
-                     enabled=excluded.enabled,promptable=excluded.promptable, \
-                     activation=excluded.activation,priority=excluded.priority, \
-                     values_json=excluded.values_json",
-                    params![
-                        node.id,
-                        node.domain_id,
-                        node.title,
-                        node.enabled,
-                        node.promptable,
-                        activation_name(node.activation),
-                        node.priority,
-                        values,
-                    ],
-                )
-                .map_err(|error| format!("cannot save node {}: {error}", node.id))?;
+                .execute("DELETE FROM edges WHERE target_id=?1", [&edit.node.id])
+                .map_err(|error| format!("cannot replace term rules: {error}"))?;
+            for edge in &edit.incoming_edges {
+                write_edge(transaction, edge)?;
+            }
             Ok(())
         })
     }
@@ -270,7 +320,7 @@ impl GraphStore {
         if patch.ids.is_empty() {
             return Err("node state patch needs at least one ID".into());
         }
-        if patch.enabled.is_none() && patch.domain_id.is_none() {
+        if patch.enabled.is_none() && patch.domain_id.is_none() && patch.inherit_domain.is_none() {
             return Err("node state patch has no changes".into());
         }
         if let Some(domain_id) = &patch.domain_id {
@@ -297,21 +347,11 @@ impl GraphStore {
                 }
             }
             for id in &patch.ids {
-                let updated = match (patch.enabled, patch.domain_id.as_deref()) {
-                    (Some(enabled), Some(domain_id)) => transaction.execute(
-                        "UPDATE nodes SET enabled=?1,domain_id=?2 WHERE id=?3",
-                        params![enabled, domain_id, id],
-                    ),
-                    (Some(enabled), None) => transaction.execute(
-                        "UPDATE nodes SET enabled=?1 WHERE id=?2",
-                        params![enabled, id],
-                    ),
-                    (None, Some(domain_id)) => transaction.execute(
-                        "UPDATE nodes SET domain_id=?1 WHERE id=?2",
-                        params![domain_id, id],
-                    ),
-                    (None, None) => unreachable!(),
-                }
+                let updated = transaction.execute(
+                    "UPDATE nodes SET enabled=COALESCE(?1,enabled), domain_id=COALESCE(?2,domain_id), \
+                     inherit_domain=COALESCE(?3,inherit_domain) WHERE id=?4",
+                    params![patch.enabled, patch.domain_id, patch.inherit_domain, id],
+                )
                 .map_err(|error| format!("cannot update node {id}: {error}"))?;
                 if updated != 1 {
                     return Err(format!("unknown graph node {id}"));
@@ -322,23 +362,7 @@ impl GraphStore {
     }
 
     pub fn upsert_edge(&self, edge: &GraphEdge) -> Result<(), String> {
-        check_id(&edge.source_id, "edge source ID")?;
-        check_id(&edge.target_id, "edge target ID")?;
-        self.edit(|transaction| {
-            transaction
-                .execute(
-                    "INSERT INTO edges (source_id,target_id,kind,enabled) VALUES (?1,?2,?3,?4) \
-                     ON CONFLICT(source_id,target_id,kind) DO UPDATE SET enabled=excluded.enabled",
-                    params![
-                        edge.source_id,
-                        edge.target_id,
-                        edge.kind.as_str(),
-                        edge.enabled
-                    ],
-                )
-                .map_err(|error| format!("cannot save edge: {error}"))?;
-            Ok(())
-        })
+        self.edit(|transaction| write_edge(transaction, edge))
     }
 
     pub fn delete_domain(&self, id: &str) -> Result<(), String> {
@@ -431,6 +455,114 @@ impl GraphStore {
     }
 }
 
+fn write_domain(transaction: &Transaction<'_>, domain: &GraphDomain) -> Result<(), String> {
+    check_id(&domain.id, "domain ID")?;
+    check_title(&domain.title, "domain title")?;
+    if let Some(parent_id) = &domain.parent_id {
+        check_id(parent_id, "parent domain ID")?;
+    }
+    if domain.id == VRCX_DOMAIN_ID && domain.parent_id.is_some() {
+        return Err("VRCX must remain a root domain".into());
+    }
+
+    let cue_words = domain.cue_words.as_ref().map(|words| {
+        let mut seen = HashSet::new();
+        words
+            .iter()
+            .map(|word| word.trim())
+            .filter(|word| !word.is_empty())
+            .filter(|word| seen.insert(word.to_lowercase()))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    });
+    if let Some(words) = &cue_words {
+        for word in words {
+            check_cue(word)?;
+        }
+    }
+    let cues = cue_words
+        .map(|words| serde_json::to_string(&words))
+        .transpose()
+        .map_err(|error| format!("cannot encode domain cues: {error}"))?;
+    transaction
+    .execute(
+        "INSERT INTO domains (id,title,enabled,parent_id,cue_words_json) VALUES (?1,?2,?3,?4,?5) \
+         ON CONFLICT(id) DO UPDATE SET title=excluded.title, \
+         enabled=excluded.enabled, parent_id=excluded.parent_id, cue_words_json=excluded.cue_words_json",
+        params![domain.id, domain.title, domain.enabled, domain.parent_id, cues],
+    )
+    .map_err(|error| format!("cannot save domain {}: {error}", domain.id))?;
+    Ok(())
+}
+
+fn write_node(transaction: &Transaction<'_>, node: &GraphNode) -> Result<(), String> {
+    check_id(&node.id, "node ID")?;
+    check_id(&node.domain_id, "node domain ID")?;
+    check_title(&node.title, "node title")?;
+    if node.activation == CorpusActivation::RuntimeOnly {
+        return Err("runtime-only activation is reserved for transient providers".into());
+    }
+    CorpusTerm {
+        ordered_values: node.values.clone(),
+    }
+    .validate("graph node")?;
+    let aliases = crate::aliases::term_aliases(&node.values, &node.recognition_aliases)?;
+    let aliases: crate::RecognitionAliases = aliases
+        .into_iter()
+        .filter(|rule| !rule.variants.is_empty())
+        .map(|rule| (rule.language, rule.variants))
+        .collect();
+    let aliases = serde_json::to_string(&aliases)
+        .map_err(|error| format!("cannot encode recognition aliases: {error}"))?;
+    let values = serde_json::to_string(&node.values)
+        .map_err(|error| format!("cannot encode node values: {error}"))?;
+
+    transaction
+        .execute(
+            "INSERT INTO nodes \
+         (id,domain_id,title,enabled,promptable,activation,priority,values_json,inherit_domain,recognition_aliases_json) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+         ON CONFLICT(id) DO UPDATE SET \
+         domain_id=excluded.domain_id,title=excluded.title, \
+         enabled=excluded.enabled,promptable=excluded.promptable, \
+         activation=excluded.activation,priority=excluded.priority, \
+         values_json=excluded.values_json, inherit_domain=excluded.inherit_domain, recognition_aliases_json=excluded.recognition_aliases_json",
+            params![
+                node.id,
+                node.domain_id,
+                node.title,
+                node.enabled,
+                node.promptable,
+                activation_name(node.activation),
+                node.priority,
+                values,
+                node.inherit_domain,
+                aliases,
+            ],
+        )
+        .map_err(|error| format!("cannot save node {}: {error}", node.id))?;
+    Ok(())
+}
+
+fn write_edge(transaction: &Transaction<'_>, edge: &GraphEdge) -> Result<(), String> {
+    check_id(&edge.source_id, "edge source ID")?;
+    check_id(&edge.target_id, "edge target ID")?;
+
+    transaction
+        .execute(
+            "INSERT INTO edges (source_id,target_id,kind,enabled) VALUES (?1,?2,?3,?4) \
+         ON CONFLICT(source_id,target_id,kind) DO UPDATE SET enabled=excluded.enabled",
+            params![
+                edge.source_id,
+                edge.target_id,
+                edge.kind.as_str(),
+                edge.enabled
+            ],
+        )
+        .map_err(|error| format!("cannot save edge: {error}"))?;
+    Ok(())
+}
+
 fn publish_seed(temporary: &Path, runtime_db: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
@@ -496,7 +628,7 @@ fn database_version(database: &Connection) -> Result<i64, String> {
 fn migrate_database(database: &mut Connection) -> Result<(), String> {
     match database_version(database)? {
         DATABASE_VERSION => return Ok(()),
-        3 => {}
+        3 | 4 | 5 => {}
         version => {
             return Err(format!(
                 "unsupported corpus database version {version}; expected {DATABASE_VERSION}"
@@ -509,94 +641,125 @@ fn migrate_database(database: &mut Connection) -> Result<(), String> {
     let previous_version = database_version(&transaction)?;
     match previous_version {
         DATABASE_VERSION => return Ok(()),
-        3 => {}
+        3 | 4 | 5 => {}
         version => {
             return Err(format!(
                 "unsupported corpus database version {version}; expected {DATABASE_VERSION}"
             ));
         }
     }
-    transaction
+    if previous_version == 3 {
+        transaction
         .execute_batch(
             "ALTER TABLE domains ADD COLUMN parent_id TEXT REFERENCES domains(id) ON DELETE RESTRICT; \
              CREATE INDEX domains_parent_idx ON domains(parent_id);",
         )
         .map_err(|error| format!("cannot migrate corpus database: {error}"))?;
-    let mut used_ids = HashSet::new();
-    {
-        let mut statement = transaction
-            .prepare("SELECT id FROM domains")
-            .map_err(|error| format!("cannot read domain IDs: {error}"))?;
-        let ids = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|error| format!("cannot query domain IDs: {error}"))?;
-        for id in ids {
-            used_ids.insert(id.map_err(|error| format!("invalid domain ID: {error}"))?);
+        let mut used_ids = HashSet::new();
+        {
+            let mut statement = transaction
+                .prepare("SELECT id FROM domains")
+                .map_err(|error| format!("cannot read domain IDs: {error}"))?;
+            let ids = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| format!("cannot query domain IDs: {error}"))?;
+            for id in ids {
+                used_ids.insert(id.map_err(|error| format!("invalid domain ID: {error}"))?);
+            }
         }
-    }
-    let groups = {
-        let mut statement = transaction
-            .prepare(
-                "SELECT domain_id,subdomain FROM nodes \
+        let groups = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT domain_id,subdomain FROM nodes \
                  GROUP BY domain_id,subdomain ORDER BY domain_id,subdomain",
-            )
-            .map_err(|error| format!("cannot read node groups: {error}"))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|error| format!("cannot query node groups: {error}"))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("invalid node group: {error}"))?
-    };
-    for (parent_id, subdomain) in groups {
-        let group_id = unique_child_id(&parent_id, &subdomain, &mut used_ids);
-        transaction
-            .execute(
-                "INSERT INTO domains (id,title,enabled,parent_id) VALUES (?1,?2,1,?3)",
-                params![group_id, group_title(&subdomain), parent_id],
-            )
-            .map_err(|error| format!("cannot add domain {group_id}: {error}"))?;
-        transaction
-            .execute(
-                "UPDATE nodes SET domain_id=?1 WHERE domain_id=?2 AND subdomain=?3",
-                params![group_id, parent_id, subdomain],
-            )
-            .map_err(|error| format!("cannot group {parent_id}/{subdomain} nodes: {error}"))?;
-        if parent_id == "games" && subdomain == "overwatch" {
-            let heroes: i64 = transaction
-                .query_row(
-                    "SELECT COUNT(*) FROM nodes \
-                     WHERE domain_id=?1 AND id GLOB 'games.overwatch.heroes.*'",
-                    [&group_id],
-                    |row| row.get(0),
                 )
-                .map_err(|error| format!("cannot inspect Overwatch heroes: {error}"))?;
-            if heroes != 0 {
-                let heroes_id = unique_child_id(&group_id, "heroes", &mut used_ids);
-                transaction
+                .map_err(|error| format!("cannot read node groups: {error}"))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| format!("cannot query node groups: {error}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("invalid node group: {error}"))?
+        };
+        for (parent_id, subdomain) in groups {
+            let group_id = unique_child_id(&parent_id, &subdomain, &mut used_ids);
+            transaction
+                .execute(
+                    "INSERT INTO domains (id,title,enabled,parent_id) VALUES (?1,?2,1,?3)",
+                    params![group_id, group_title(&subdomain), parent_id],
+                )
+                .map_err(|error| format!("cannot add domain {group_id}: {error}"))?;
+            transaction
+                .execute(
+                    "UPDATE nodes SET domain_id=?1 WHERE domain_id=?2 AND subdomain=?3",
+                    params![group_id, parent_id, subdomain],
+                )
+                .map_err(|error| format!("cannot group {parent_id}/{subdomain} nodes: {error}"))?;
+            if parent_id == "games" && subdomain == "overwatch" {
+                let heroes: i64 = transaction
+                    .query_row(
+                        "SELECT COUNT(*) FROM nodes \
+                     WHERE domain_id=?1 AND id GLOB 'games.overwatch.heroes.*'",
+                        [&group_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| format!("cannot inspect Overwatch heroes: {error}"))?;
+                if heroes != 0 {
+                    let heroes_id = unique_child_id(&group_id, "heroes", &mut used_ids);
+                    transaction
                     .execute(
                         "INSERT INTO domains (id,title,enabled,parent_id) VALUES (?1,'Heroes',1,?2)",
                         params![heroes_id, group_id],
                     )
                     .map_err(|error| format!("cannot add Heroes domain: {error}"))?;
-                transaction
-                    .execute(
-                        "UPDATE nodes SET domain_id=?1 \
+                    transaction
+                        .execute(
+                            "UPDATE nodes SET domain_id=?1 \
                          WHERE domain_id=?2 AND id GLOB 'games.overwatch.heroes.*'",
-                        params![heroes_id, group_id],
-                    )
-                    .map_err(|error| format!("cannot group Overwatch heroes: {error}"))?;
+                            params![heroes_id, group_id],
+                        )
+                        .map_err(|error| format!("cannot group Overwatch heroes: {error}"))?;
+                }
             }
         }
-    }
-    transaction
-        .execute_batch(
-            "DROP INDEX nodes_by_domain; \
+        transaction
+            .execute_batch(
+                "DROP INDEX nodes_by_domain; \
              ALTER TABLE nodes DROP COLUMN subdomain; \
              CREATE INDEX nodes_by_domain ON nodes(domain_id,enabled);",
+            )
+            .map_err(|error| format!("cannot finish corpus database migration: {error}"))?;
+    }
+    if previous_version < 5 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE domains ADD COLUMN cue_words_json TEXT; \
+             ALTER TABLE nodes ADD COLUMN inherit_domain INTEGER NOT NULL DEFAULT 0;",
+            )
+            .map_err(|error| format!("cannot add domain activation rules: {error}"))?;
+        transaction
+            .pragma_update(None, "user_version", 5)
+            .map_err(|error| format!("cannot advance corpus schema: {error}"))?;
+    }
+    let legacy = read_snapshot(&transaction)?;
+    transaction
+        .execute_batch(
+            "ALTER TABLE nodes ADD COLUMN recognition_aliases_json TEXT NOT NULL DEFAULT '{}';",
         )
-        .map_err(|error| format!("cannot finish corpus database migration: {error}"))?;
+        .map_err(|error| format!("cannot add recognition aliases: {error}"))?;
+    for node in &legacy.nodes {
+        if !node.recognition_aliases.is_empty() {
+            let aliases = serde_json::to_string(&node.recognition_aliases)
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "UPDATE nodes SET recognition_aliases_json=?1 WHERE id=?2",
+                    params![aliases, node.id],
+                )
+                .map_err(|error| format!("cannot migrate recognition aliases: {error}"))?;
+        }
+    }
     transaction
         .pragma_update(None, "user_version", DATABASE_VERSION)
         .map_err(|error| format!("cannot set corpus database version: {error}"))?;
@@ -657,7 +820,7 @@ fn group_title(slug: &str) -> String {
 
 fn check_database(database: &Connection) -> Result<(), String> {
     let version = database_version(database)?;
-    if version != DATABASE_VERSION {
+    if !matches!(version, 4 | 5 | DATABASE_VERSION) {
         return Err(format!(
             "unsupported corpus database version {version}; expected {DATABASE_VERSION}"
         ));
@@ -673,8 +836,14 @@ fn check_database(database: &Connection) -> Result<(), String> {
 
 fn read_snapshot(database: &Connection) -> Result<GraphSnapshot, String> {
     let mut snapshot = GraphSnapshot::default();
+    let version = database_version(database)?;
+    let legacy = version == 4;
     let mut statement = database
-        .prepare("SELECT id,title,enabled,parent_id FROM domains ORDER BY id")
+        .prepare(if legacy {
+            "SELECT id,title,enabled,parent_id,NULL FROM domains ORDER BY id"
+        } else {
+            "SELECT id,title,enabled,parent_id,cue_words_json FROM domains ORDER BY id"
+        })
         .map_err(|error| format!("cannot read domains: {error}"))?;
     let rows = statement
         .query_map([], |row| {
@@ -683,6 +852,18 @@ fn read_snapshot(database: &Connection) -> Result<GraphSnapshot, String> {
                 title: row.get(1)?,
                 enabled: row.get(2)?,
                 parent_id: row.get(3)?,
+                cue_words: row
+                    .get::<_, Option<String>>(4)?
+                    .map(|text| {
+                        serde_json::from_str(&text).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })
+                    })
+                    .transpose()?,
             })
         })
         .map_err(|error| format!("cannot query domains: {error}"))?;
@@ -694,8 +875,9 @@ fn read_snapshot(database: &Connection) -> Result<GraphSnapshot, String> {
 
     let mut statement = database
         .prepare(
-            "SELECT id,domain_id,title,enabled,promptable,activation,priority,values_json \
-             FROM nodes ORDER BY id",
+            if legacy { "SELECT id,domain_id,title,enabled,promptable,activation,priority,values_json,0,'{}' FROM nodes ORDER BY id" }
+            else if version == 5 { "SELECT id,domain_id,title,enabled,promptable,activation,priority,values_json,inherit_domain,'{}' FROM nodes ORDER BY id" }
+            else { "SELECT id,domain_id,title,enabled,promptable,activation,priority,values_json,inherit_domain,recognition_aliases_json FROM nodes ORDER BY id" },
         )
         .map_err(|error| format!("cannot read nodes: {error}"))?;
     let rows = statement
@@ -711,12 +893,24 @@ fn read_snapshot(database: &Connection) -> Result<GraphSnapshot, String> {
                 activation,
                 row.get::<_, i32>(6)?,
                 values,
+                row.get::<_, bool>(8)?,
+                row.get::<_, String>(9)?,
             ))
         })
         .map_err(|error| format!("cannot query nodes: {error}"))?;
     for row in rows {
-        let (id, domain_id, title, enabled, promptable, activation, priority, values) =
-            row.map_err(|error| format!("invalid node row: {error}"))?;
+        let (
+            id,
+            domain_id,
+            title,
+            enabled,
+            promptable,
+            activation,
+            priority,
+            values,
+            inherit_domain,
+            recognition_aliases,
+        ) = row.map_err(|error| format!("invalid node row: {error}"))?;
         snapshot.nodes.push(GraphNode {
             id,
             domain_id,
@@ -724,6 +918,9 @@ fn read_snapshot(database: &Connection) -> Result<GraphSnapshot, String> {
             enabled,
             promptable,
             activation: parse_activation(&activation)?,
+            inherit_domain,
+            recognition_aliases: serde_json::from_str(&recognition_aliases)
+                .map_err(|error| format!("invalid recognition aliases: {error}"))?,
             priority,
             values: serde_json::from_str(&values)
                 .map_err(|error| format!("invalid node values: {error}"))?,
@@ -755,6 +952,9 @@ fn read_snapshot(database: &Connection) -> Result<GraphSnapshot, String> {
             enabled,
         });
     }
+    if version < 6 {
+        crate::aliases::import_legacy_aliases(&mut snapshot);
+    }
     Ok(snapshot)
 }
 
@@ -763,6 +963,7 @@ struct DomainState<'a> {
     root: &'a str,
     first_child: Option<&'a str>,
     enabled: bool,
+    cue_words: &'a [String],
 }
 
 impl DomainState<'_> {
@@ -804,6 +1005,7 @@ fn resolve_domain<'a>(
                 root: current,
                 first_child: None,
                 enabled: true,
+                cue_words: &[],
             };
             break;
         }
@@ -818,6 +1020,7 @@ fn resolve_domain<'a>(
                 state.first_child
             },
             enabled: state.enabled && domain.enabled,
+            cue_words: domain.cue_words.as_deref().unwrap_or(state.cue_words),
         };
         resolved.insert(next, state);
     }
@@ -834,6 +1037,11 @@ fn project(snapshot: &GraphSnapshot) -> Result<GraphProjection, String> {
         }
         if domain.id == VRCX_DOMAIN_ID && domain.parent_id.is_some() {
             return Err("VRCX must remain a root domain".into());
+        }
+        if let Some(words) = &domain.cue_words {
+            for word in words {
+                check_cue(word)?;
+            }
         }
         if domains.insert(domain.id.as_str(), domain).is_some() {
             return Err(format!("duplicate domain {}", domain.id));
@@ -913,23 +1121,59 @@ fn project(snapshot: &GraphSnapshot) -> Result<GraphProjection, String> {
         dedup_sources(&mut triggers, &normalized);
         dedup_sources(&mut trigger_aliases, &normalized);
         dedup_sources(&mut activation_context, &normalized);
-        if node.activation == CorpusActivation::OnEvidence
+        let recognition_aliases =
+            crate::aliases::term_aliases(&node.values, &node.recognition_aliases)?;
+        let inherited = node.inherit_domain;
+        let domain = domains[node.domain_id.as_str()];
+        let cues = domain_states[node.domain_id.as_str()].cue_words;
+        let activation = if inherited {
+            if cues.is_empty() {
+                CorpusActivation::Always
+            } else {
+                CorpusActivation::OnEvidence
+            }
+        } else {
+            node.activation
+        };
+        if !inherited
+            && activation == CorpusActivation::OnEvidence
             && triggers.is_empty()
             && trigger_aliases.is_empty()
         {
             continue;
         }
-        let collection = node
-            .id
-            .rsplit_once(".term-")
-            .map_or(node.id.as_str(), |(prefix, _)| prefix)
-            .to_owned();
+        if inherited {
+            triggers.clear();
+            trigger_aliases.clear();
+            activation_context.clear();
+        }
+        let collection = if inherited {
+            format!(
+                "domain-{:016x}-{}",
+                node.domain_id
+                    .bytes()
+                    .fold(0xcbf29ce484222325_u64, |hash, byte| (hash
+                        ^ u64::from(byte))
+                    .wrapping_mul(0x100000001b3)),
+                node.priority
+            )
+        } else {
+            node.id
+                .rsplit_once(".term-")
+                .map_or(node.id.as_str(), |(prefix, _)| prefix)
+                .to_owned()
+        };
+        let title = if inherited {
+            &domain.title
+        } else {
+            &node.title
+        };
         let signature = serde_json::to_string(&(
             &collection,
             &node.domain_id,
-            &node.title,
+            title,
             node.priority,
-            activation_name(node.activation),
+            activation_name(activation),
             triggers
                 .iter()
                 .map(|source| normalized[source.id.as_str()].as_str())
@@ -945,6 +1189,12 @@ fn project(snapshot: &GraphSnapshot) -> Result<GraphProjection, String> {
         ))
         .map_err(|error| format!("cannot group graph node: {error}"))?;
         if let Some(&index) = group_indexes.get(&signature) {
+            groups[index]
+                .definition
+                .recognition_aliases
+                .as_mut()
+                .unwrap()
+                .extend(recognition_aliases);
             groups[index].definition.terms.push(CorpusTerm {
                 ordered_values: node.values.clone(),
             });
@@ -957,15 +1207,17 @@ fn project(snapshot: &GraphSnapshot) -> Result<GraphProjection, String> {
             subdomain: domain_states[node.domain_id.as_str()]
                 .subdomain()
                 .to_owned(),
-            title: node.title.clone(),
+            title: title.clone(),
             priority: node.priority,
-            activation: node.activation,
+            activation,
             triggers: triggers
                 .iter()
                 .map(|source| CorpusTerm {
                     ordered_values: source.values.clone(),
                 })
                 .collect(),
+            topic_words: if inherited { cues.to_vec() } else { Vec::new() },
+            recognition_aliases: Some(recognition_aliases),
             trigger_aliases: trigger_aliases
                 .iter()
                 .map(|source| CorpusTerm {
@@ -1014,7 +1266,9 @@ fn project(snapshot: &GraphSnapshot) -> Result<GraphProjection, String> {
             suffix += 1;
         }
         group.definition.id = id;
-        group.definition.validate()?;
+        // The local graph is already validated node by node. Its shared domains
+        // are not subject to the per-provider payload limit of 512 terms.
+        group.definition.validate_with_term_limit(usize::MAX)?;
         corpora.push(group.definition);
     }
     Ok(GraphProjection {
@@ -1022,6 +1276,16 @@ fn project(snapshot: &GraphSnapshot) -> Result<GraphProjection, String> {
         disabled_domains,
         revision: 0,
     })
+}
+
+pub(crate) fn check_cue(word: &str) -> Result<(), String> {
+    if word.trim().is_empty() || word.chars().count() > 512 || word.contains([',', '\r', '\n']) {
+        return Err(
+            "domain cue must be a nonempty phrase without commas or newlines, up to 512 characters"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn check_id(value: &str, label: &str) -> Result<(), String> {

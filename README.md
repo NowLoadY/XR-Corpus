@@ -7,7 +7,9 @@ keeps bounded bilingual conversation history, and exposes HTTP and Rust client A
 ## Design
 
 - Domains form a tree, so games and their term categories can be managed independently. Each
-  vocabulary node has a required domain and sixteen ordered language values. Directed
+  vocabulary node has a required domain and sixteen ordered language values. Domain topic words
+  are configured once and inherited by member terms and child domains. Individual overrides
+  remain available for exceptions. Directed
   trigger and context edges connect nodes; an edge with a missing or disabled endpoint stays
   stored but does not activate vocabulary.
 - The editable graph lives in `runtime/xr-corpus.sqlite`. On first launch, the service copies
@@ -56,3 +58,8 @@ Its source file retains SPDX attribution.
 ## License
 
 GNU Affero General Public License v3.0 only (`AGPL-3.0-only`).
+
+Recognition aliases are term attributes, independent of domain activation. The editor can attach
+`fanboy` to the English canonical word `femboy` without graph wiring; domain inheritance and
+moves retain this correction. Only canonical words enter ASR vocabulary. The v6 database migration
+preserves existing corrections while keeping activation edges compatible.

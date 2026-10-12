@@ -473,6 +473,8 @@ fn room_corpus(room: &RoomSnapshot) -> Result<CorpusDefinition, String> {
         activation: CorpusActivation::RuntimeOnly,
         triggers: Vec::new(),
         trigger_aliases: Vec::new(),
+        recognition_aliases: None,
+        topic_words: Vec::new(),
         activation_context: Vec::new(),
         terms: values
             .iter()
@@ -492,6 +494,8 @@ fn game_mode_corpus() -> Result<CorpusDefinition, String> {
         activation: CorpusActivation::Always,
         triggers: Vec::new(),
         trigger_aliases: Vec::new(),
+        recognition_aliases: None,
+        topic_words: Vec::new(),
         activation_context: Vec::new(),
         terms: vec![
             multilingual_proper_name("VRChat")?,

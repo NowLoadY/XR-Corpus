@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 pub use xr_corpus_core::{
     CORPUS_LANGUAGE_ORDER, CORPUS_SCHEMA, CorpusActivation, CorpusDefinition, CorpusTerm,
-    GraphDomain, GraphEdge, GraphEdgeKind, GraphNode, GraphNodeStatePatch, GraphSnapshot,
-    VRCX_DOMAIN_ID,
+    GraphDomain, GraphDomainEdit, GraphEdge, GraphEdgeKind, GraphNode, GraphNodeStatePatch,
+    GraphSnapshot, GraphTermEdit, RecognitionAlias, RecognitionAliases, VRCX_DOMAIN_ID,
 };
 pub const API_VERSION: u16 = 2;
 
@@ -50,7 +50,15 @@ pub struct HealthResponse {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct CreateSessionRequest {}
+pub struct CreateSessionRequest {
+    /// Explicit opt-in to shared translation history. Recognition and topic
+    /// state remain private to each session; omitted IDs preserve isolation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    /// Human-readable input lane, such as microphone, system-audio or text.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub input_source: String,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateSessionResponse {
@@ -127,6 +135,9 @@ pub struct SegmentContext {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranslationContextData {
+    /// Identity of the current input in the shared conversation.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub current_speaker_id: String,
     /// Completed earlier logical turns, oldest first and bounded by the
     /// session's configured history and model budget.
     #[serde(default)]
@@ -279,6 +290,7 @@ mod tests {
             corrected_text: "Tell the team.".into(),
             prompt_terms: Vec::new(),
             context_data: TranslationContextData {
+                current_speaker_id: String::new(),
                 recent_turns: vec![BilingualContextTurn {
                     turn_id: Some("previous".into()),
                     speaker_id: "speaker-01".into(),

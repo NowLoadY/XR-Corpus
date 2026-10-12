@@ -30,6 +30,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     activation: CorpusActivation::Always,
                     triggers: Vec::new(),
                     trigger_aliases: Vec::new(),
+                    recognition_aliases: None,
+                    topic_words: Vec::new(),
                     activation_context: Vec::new(),
                     terms: vec![multilingual_term("Player One")],
                 }],

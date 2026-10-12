@@ -8,7 +8,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -24,8 +24,8 @@ use clap::Parser;
 use serde::Deserialize;
 use tracing::{info, warn};
 use xr_corpus_core::{
-    CorpusCatalog, CorpusConfig, DynamicCorpusSource, GraphDomain, GraphEdge, GraphNode,
-    GraphNodeStatePatch, GraphSnapshot, GraphStore,
+    CorpusCatalog, CorpusConfig, DynamicCorpusSource, GraphDomainEdit, GraphEdge, GraphNode,
+    GraphNodeStatePatch, GraphSnapshot, GraphStore, GraphTermEdit,
 };
 use xr_corpus_protocol::{
     API_VERSION, ContextBudgets, CreateSessionRequest, CreateSessionResponse, ErrorResponse,
@@ -33,7 +33,9 @@ use xr_corpus_protocol::{
     PrepareTranslationResponse, ProviderSnapshotResponse, PublishProviderRequest,
     RecordTranslationRequest, RecordTranslationResponse, SegmentContext, SessionStateResponse,
 };
-use xr_corpus_session::{CurrentTurnContext, PromptContextManager, PromptContextSnapshot};
+use xr_corpus_session::{
+    CurrentTurnContext, PromptContextManager, PromptContextSnapshot, SharedDialogueHistory,
+};
 
 mod vrcx;
 
@@ -54,6 +56,7 @@ struct Arguments {
 #[derive(Clone)]
 struct AppState {
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<CorpusSession>>>>>,
+    conversations: Arc<Mutex<HashMap<String, Weak<SharedDialogueHistory>>>>,
     catalog: CorpusCatalog,
     graph: GraphStore,
     config: CorpusConfig,
@@ -64,6 +67,7 @@ struct AppState {
 }
 
 struct CorpusSession {
+    input_source: Option<String>,
     manager: PromptContextManager,
     snapshots: HashMap<u64, PromptContextSnapshot>,
     observed_turn_ids: HashSet<String>,
@@ -73,6 +77,24 @@ struct CorpusSession {
 }
 
 impl CorpusSession {
+    fn context_identity(
+        &self,
+        session_id: &str,
+        turn_id: &Option<String>,
+        speaker_id: &str,
+    ) -> (Option<String>, String) {
+        let Some(source) = &self.input_source else {
+            return (turn_id.clone(), speaker_id.to_owned());
+        };
+        let turn_id = turn_id.as_ref().map(|id| format!("{session_id}/{id}"));
+        let speaker = if speaker_id.trim().is_empty() || speaker_id == "speaker-unknown" {
+            source.clone()
+        } else {
+            format!("{source}/{session_id}/{}", speaker_id.trim())
+        };
+        (turn_id, speaker)
+    }
+
     fn should_advance_topic(&mut self, turn_id: Option<&str>, has_text: bool) -> bool {
         if !has_text {
             return false;
@@ -140,6 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _vrcx_monitor = vrcx.start();
     let state = AppState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        conversations: Arc::new(Mutex::new(HashMap::new())),
         catalog,
         graph,
         config: config.prompt_context,
@@ -157,6 +180,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             put(upsert_domain).delete(delete_domain),
         )
         .route("/v2/graph/nodes", put(patch_node_state))
+        .route("/v2/graph/terms/{id}", put(save_term))
+        .route("/v2/graph/terms", post(import_terms).layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)))
         .route("/v2/graph/nodes/{id}", put(upsert_node).delete(delete_node))
         .route("/v2/graph/edges", put(upsert_edge).delete(delete_edge))
         .route("/v2/integrations/vrcx/status", get(vrcx::get_status))
@@ -206,14 +231,14 @@ async fn graph_snapshot(State(state): State<AppState>) -> ApiResult<GraphSnapsho
 async fn upsert_domain(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(domain): Json<GraphDomain>,
+    Json(edit): Json<GraphDomainEdit>,
 ) -> ApiResult<GraphSnapshot> {
-    if id != domain.id {
+    if id != edit.domain.id {
         return Err(bad_request("id_mismatch", "domain ID differs from URL"));
     }
     state
         .graph
-        .upsert_domain(&domain)
+        .save_domain_rules(&edit)
         .map_err(|message| bad_request("invalid_domain", message))?;
     graph_snapshot(State(state)).await
 }
@@ -226,6 +251,30 @@ async fn delete_domain(
         .graph
         .delete_domain(&id)
         .map_err(|message| bad_request("invalid_domain", message))?;
+    graph_snapshot(State(state)).await
+}
+
+async fn import_terms(
+    State(state): State<AppState>,
+    Json(nodes): Json<Vec<GraphNode>>,
+) -> ApiResult<GraphSnapshot> {
+    state.graph.import_terms(&nodes)
+        .map_err(|message| bad_request("invalid_terms", message))?;
+    graph_snapshot(State(state)).await
+}
+
+async fn save_term(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(edit): Json<GraphTermEdit>,
+) -> ApiResult<GraphSnapshot> {
+    if id != edit.node.id {
+        return Err(bad_request("id_mismatch", "term ID differs from URL"));
+    }
+    state
+        .graph
+        .save_term(&edit)
+        .map_err(|message| bad_request("invalid_term", message))?;
     graph_snapshot(State(state)).await
 }
 
@@ -290,15 +339,52 @@ async fn delete_edge(
 
 async fn create_session(
     State(state): State<AppState>,
-    Json(_request): Json<CreateSessionRequest>,
+    Json(request): Json<CreateSessionRequest>,
 ) -> ApiResult<CreateSessionResponse> {
     let id = state.next_session_id.fetch_add(1, Ordering::Relaxed);
     let session_id = format!("session-{id}");
-    let manager = PromptContextManager::new(state.config.clone(), state.catalog.clone())
+    let mut manager = PromptContextManager::new(state.config.clone(), state.catalog.clone())
         .map_err(internal_error)?;
+    let input_source = if let Some(conversation_id) = request
+        .conversation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        if conversation_id.len() > 128 || request.input_source.len() > 64 {
+            return Err(bad_request(
+                "invalid_conversation",
+                "Conversation ID or input source is too long",
+            ));
+        }
+        let mut conversations = state.conversations.lock().map_err(lock_error)?;
+        conversations.retain(|_, history| history.strong_count() > 0);
+        let history = conversations
+            .get(conversation_id)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| {
+                let history = Arc::new(SharedDialogueHistory::new(state.config.max_entries));
+                conversations.insert(conversation_id.to_owned(), Arc::downgrade(&history));
+                history
+            });
+        manager.share_dialogue(history);
+        let source = request
+            .input_source
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        Some(if source.is_empty() {
+            session_id.clone()
+        } else {
+            source
+        })
+    } else {
+        None
+    };
     state.sessions.lock().map_err(lock_error)?.insert(
         session_id.clone(),
         Arc::new(Mutex::new(CorpusSession {
+            input_source,
             manager,
             snapshots: HashMap::new(),
             observed_turn_ids: HashSet::new(),
@@ -417,6 +503,8 @@ async fn prepare_translation(
             "ASR context snapshot has expired",
         ));
     }
+    let (turn_id, speaker_id) =
+        session.context_identity(&session_id, &request.turn_id, &request.speaker_id);
     let advance_topic = session.should_advance_topic(
         request.turn_id.as_deref(),
         !request.recognized_text.trim().is_empty(),
@@ -430,8 +518,8 @@ async fn prepare_translation(
             budgets(request.budgets),
             advance_topic,
             CurrentTurnContext {
-                turn_id: request.turn_id.as_deref(),
-                speaker_id: &request.speaker_id,
+                turn_id: turn_id.as_deref(),
+                speaker_id: &speaker_id,
                 source_text: (request.segments.len() > 1)
                     .then_some(request.recognized_text.as_str()),
             },
@@ -488,9 +576,11 @@ async fn record_translation(
         &request.translated_text,
         &request.target_language,
     );
+    let (turn_id, speaker_id) =
+        session.context_identity(&session_id, &request.turn_id, &request.speaker_id);
     session.manager.record_translation_turn(
-        request.turn_id.as_deref(),
-        &request.speaker_id,
+        turn_id.as_deref(),
+        &speaker_id,
         &request.source_language,
         &request.target_language,
         &request.source_text,
