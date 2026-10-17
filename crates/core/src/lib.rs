@@ -32,16 +32,13 @@ const MAX_ITEM_CHARS: usize = 512;
 pub struct CorpusConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Maximum recent recognition turns retained as vocabulary evidence.
     #[serde(default = "default_max_entries")]
     pub max_entries: usize,
     #[serde(default = "default_asr_max_chars")]
     pub asr_max_chars: usize,
     #[serde(default = "default_translation_max_chars")]
     pub translation_max_chars: usize,
-    #[serde(default = "default_asr_history_entries")]
-    pub asr_history_entries: usize,
-    #[serde(default = "default_translation_history_entries")]
-    pub translation_history_entries: usize,
     #[serde(default = "default_database_path")]
     pub database_path: PathBuf,
     #[serde(default = "default_seed_database_path")]
@@ -55,8 +52,6 @@ impl Default for CorpusConfig {
             max_entries: default_max_entries(),
             asr_max_chars: default_asr_max_chars(),
             translation_max_chars: default_translation_max_chars(),
-            asr_history_entries: default_asr_history_entries(),
-            translation_history_entries: default_translation_history_entries(),
             database_path: default_database_path(),
             seed_database_path: default_seed_database_path(),
         }
@@ -75,12 +70,7 @@ const fn default_asr_max_chars() -> usize {
 const fn default_translation_max_chars() -> usize {
     1_200
 }
-const fn default_asr_history_entries() -> usize {
-    1
-}
-const fn default_translation_history_entries() -> usize {
-    6
-}
+
 fn default_database_path() -> PathBuf {
     PathBuf::from("runtime/xr-corpus.sqlite")
 }

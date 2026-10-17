@@ -1,8 +1,8 @@
 # XR Corpus
 
 XR Corpus is a local, session-aware terminology service for speech recognition and translation.
-It selects vocabulary from a user-editable SQLite concept graph within each model's budget,
-keeps bounded bilingual conversation history, and exposes HTTP and Rust client APIs.
+It selects vocabulary from a user-editable SQLite concept graph within each model's budget
+and exposes HTTP and Rust client APIs.
 
 ## Design
 
@@ -17,10 +17,11 @@ keeps bounded bilingual conversation history, and exposes HTTP and Rust client A
   keep the user's database. SQLite schema changes are governed by `PRAGMA user_version`.
 - The database uses rollback journaling, so a stopped application's graph can be shared by
   copying one file.
-- Activation state and context snapshots belong to a server-side session.
+- Activation state, bounded recognition evidence and vocabulary snapshots belong to a server-side session.
+  Callers own conversation memory and provide relevant context when selecting terminology.
 - The persistent graph and short-lived runtime providers enter one selection pipeline.
-- Callers receive stable, neutral context data and provenance spans, not
-  rendered translation prompts or internal catalog/UI template objects.
+- Callers receive vocabulary, recognition corrections and provenance spans as structured data.
+  Prompt composition and translation history remain with the translation executor.
 - Idle sessions, snapshots, and dynamic data are bounded and expire automatically.
 
 ## Run

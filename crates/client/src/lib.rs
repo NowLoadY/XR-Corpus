@@ -5,11 +5,11 @@ use std::time::Duration;
 use reqwest::StatusCode;
 pub use xr_corpus_protocol as protocol;
 use xr_corpus_protocol::{
-    API_VERSION, CreateSessionRequest, CreateSessionResponse, ErrorResponse, GraphDomain, GraphDomainEdit,
-    GraphEdge, GraphNode, GraphNodeStatePatch, GraphSnapshot, GraphTermEdit, HealthResponse,
-    PrepareAsrRequest, PrepareAsrResponse, PrepareTranslationRequest, PrepareTranslationResponse,
-    ProviderSnapshotResponse, PublishProviderRequest, RecordTranslationRequest,
-    RecordTranslationResponse, SessionStateResponse, VrcxStatusResponse,
+    API_VERSION, CreateSessionRequest, CreateSessionResponse, ErrorResponse, GraphDomain,
+    GraphDomainEdit, GraphEdge, GraphNode, GraphNodeStatePatch, GraphSnapshot, GraphTermEdit,
+    HealthResponse, PrepareAsrRequest, PrepareAsrResponse, PrepareTranslationRequest,
+    PrepareTranslationResponse, ProviderSnapshotResponse, PublishProviderRequest,
+    SessionStateResponse, VrcxStatusResponse,
 };
 
 pub type CorpusResult<T> = Result<T, CorpusClientError>;
@@ -66,7 +66,6 @@ pub struct CorpusClient {
 pub struct CorpusSessionClient {
     client: CorpusClient,
     session_id: String,
-    options: CreateSessionRequest,
 }
 
 impl CorpusClient {
@@ -126,28 +125,20 @@ impl CorpusClient {
     }
 
     pub async fn create_session(&self) -> CorpusResult<CorpusSessionClient> {
-        self.create_session_with_options(CreateSessionRequest::default())
-            .await
-    }
-
-    pub async fn create_session_with_options(
-        &self,
-        options: CreateSessionRequest,
-    ) -> CorpusResult<CorpusSessionClient> {
-        let response: CreateSessionResponse = self.post("/v2/sessions", &options).await?;
+        let response: CreateSessionResponse =
+            self.post("/v3/sessions", &CreateSessionRequest {}).await?;
         Ok(CorpusSessionClient {
             client: self.clone(),
             session_id: response.session_id,
-            options,
         })
     }
 
     pub async fn vrcx_status(&self) -> CorpusResult<VrcxStatusResponse> {
-        self.get("/v2/integrations/vrcx/status").await
+        self.get("/v3/integrations/vrcx/status").await
     }
 
     pub async fn graph(&self) -> CorpusResult<GraphSnapshot> {
-        self.get("/v2/graph").await
+        self.get("/v3/graph").await
     }
 
     pub async fn save_domain(&self, domain: &GraphDomain) -> CorpusResult<GraphSnapshot> {
@@ -156,7 +147,8 @@ impl CorpusClient {
     }
 
     pub async fn save_domain_rules(&self, edit: &GraphDomainEdit) -> CorpusResult<GraphSnapshot> {
-        self.put(&graph_item_path("domains", &edit.domain.id), edit).await
+        self.put(&graph_item_path("domains", &edit.domain.id), edit)
+            .await
     }
 
     pub async fn remove_domain(&self, id: &str) -> CorpusResult<GraphSnapshot> {
@@ -165,8 +157,14 @@ impl CorpusClient {
     }
 
     pub async fn import_terms(&self, nodes: &[GraphNode]) -> CorpusResult<GraphSnapshot> {
-        let response = self.http.post(format!("{}/v2/graph/terms", self.base_url))
-            .timeout(Duration::from_secs(60)).json(nodes).send().await.map_err(request_error)?;
+        let response = self
+            .http
+            .post(format!("{}/v3/graph/terms", self.base_url))
+            .timeout(Duration::from_secs(60))
+            .json(nodes)
+            .send()
+            .await
+            .map_err(request_error)?;
         decode(response).await
     }
 
@@ -183,7 +181,7 @@ impl CorpusClient {
         &self,
         patch: &GraphNodeStatePatch,
     ) -> CorpusResult<GraphSnapshot> {
-        self.put("/v2/graph/nodes", patch).await
+        self.put("/v3/graph/nodes", patch).await
     }
 
     pub async fn remove_node(&self, id: &str) -> CorpusResult<GraphSnapshot> {
@@ -192,11 +190,11 @@ impl CorpusClient {
     }
 
     pub async fn save_edge(&self, edge: &GraphEdge) -> CorpusResult<GraphSnapshot> {
-        self.put("/v2/graph/edges", edge).await
+        self.put("/v3/graph/edges", edge).await
     }
 
     pub async fn remove_edge(&self, edge: &GraphEdge) -> CorpusResult<GraphSnapshot> {
-        self.delete_graph("/v2/graph/edges", Some(edge)).await
+        self.delete_graph("/v3/graph/edges", Some(edge)).await
     }
 
     pub async fn publish_provider(
@@ -294,19 +292,16 @@ impl CorpusSessionClient {
     ) -> CorpusResult<PrepareAsrResponse> {
         let result = self
             .client
-            .post(&format!("/v2/sessions/{}/asr", self.session_id), request)
+            .post(&format!("/v3/sessions/{}/asr", self.session_id), request)
             .await;
         if matches!(&result, Err(CorpusClientError::Server { status: 404, code, .. }) if code == "session_not_found")
         {
             // Start a fresh turn after idle expiry. Existing clones retain the
             // old identity so in-flight results never enter the new session.
-            *self = self
-                .client
-                .create_session_with_options(self.options.clone())
-                .await?;
+            *self = self.client.create_session().await?;
             return self
                 .client
-                .post(&format!("/v2/sessions/{}/asr", self.session_id), request)
+                .post(&format!("/v3/sessions/{}/asr", self.session_id), request)
                 .await;
         }
         result
@@ -318,19 +313,7 @@ impl CorpusSessionClient {
     ) -> CorpusResult<PrepareTranslationResponse> {
         self.client
             .post(
-                &format!("/v2/sessions/{}/translation", self.session_id),
-                request,
-            )
-            .await
-    }
-
-    pub async fn record_translation(
-        &self,
-        request: &RecordTranslationRequest,
-    ) -> CorpusResult<RecordTranslationResponse> {
-        self.client
-            .post(
-                &format!("/v2/sessions/{}/results", self.session_id),
+                &format!("/v3/sessions/{}/translation", self.session_id),
                 request,
             )
             .await
@@ -338,13 +321,13 @@ impl CorpusSessionClient {
 
     pub async fn state(&self) -> CorpusResult<SessionStateResponse> {
         self.client
-            .get(&format!("/v2/sessions/{}", self.session_id))
+            .get(&format!("/v3/sessions/{}", self.session_id))
             .await
     }
 
     pub async fn close(self) -> CorpusResult<()> {
         self.client
-            .delete(&format!("/v2/sessions/{}", self.session_id))
+            .delete(&format!("/v3/sessions/{}", self.session_id))
             .await
     }
 }
@@ -424,11 +407,11 @@ fn provider_path(provider_id: &str) -> CorpusResult<String> {
             "provider ID must contain only lowercase ASCII letters, digits, and hyphens".into(),
         ));
     }
-    Ok(format!("/v2/providers/{provider_id}"))
+    Ok(format!("/v3/providers/{provider_id}"))
 }
 
 fn graph_item_path(kind: &str, id: &str) -> String {
-    let mut url = reqwest::Url::parse("http://localhost/v2/graph").expect("fixed graph URL");
+    let mut url = reqwest::Url::parse("http://localhost/v3/graph").expect("fixed graph URL");
     url.path_segments_mut()
         .expect("graph URL supports path segments")
         .extend([kind, id]);
@@ -487,17 +470,17 @@ mod tests {
     #[tokio::test]
     async fn idle_session_recovers_once_and_retains_the_new_identity_for_later_turns() {
         let (url, server) = session_server(vec![
-            ("POST /v2/sessions", 200, r#"{"session_id":"old"}"#),
+            ("POST /v3/sessions", 200, r#"{"session_id":"old"}"#),
             (
-                "POST /v2/sessions/old/asr",
+                "POST /v3/sessions/old/asr",
                 404,
                 r#"{"code":"session_not_found","error":"expired"}"#,
             ),
-            ("POST /v2/sessions", 200, r#"{"session_id":"new"}"#),
-            ("POST /v2/sessions/new/asr", 200, r#"{"context_id":1}"#),
-            ("POST /v2/sessions/new/asr", 200, r#"{"context_id":2}"#),
-            ("DELETE /v2/sessions/old", 404, ""),
-            ("DELETE /v2/sessions/new", 204, ""),
+            ("POST /v3/sessions", 200, r#"{"session_id":"new"}"#),
+            ("POST /v3/sessions/new/asr", 200, r#"{"context_id":1}"#),
+            ("POST /v3/sessions/new/asr", 200, r#"{"context_id":2}"#),
+            ("DELETE /v3/sessions/old", 404, ""),
+            ("DELETE /v3/sessions/new", 204, ""),
         ]);
         let mut session = CorpusClient::new(url)
             .unwrap()
@@ -540,13 +523,13 @@ mod tests {
                 _ => r#"{"code":"session_not_found","error":"unavailable"}"#,
             };
             let mut replies = vec![
-                ("POST /v2/sessions", 200, r#"{"session_id":"old"}"#),
-                ("POST /v2/sessions/old/asr", status, body),
+                ("POST /v3/sessions", 200, r#"{"session_id":"old"}"#),
+                ("POST /v3/sessions/old/asr", status, body),
             ];
             if status == 404 && code == "session_not_found" {
                 replies.extend([
-                    ("POST /v2/sessions", 200, r#"{"session_id":"new"}"#),
-                    ("POST /v2/sessions/new/asr", status, body),
+                    ("POST /v3/sessions", 200, r#"{"session_id":"new"}"#),
+                    ("POST /v3/sessions/new/asr", status, body),
                 ]);
             }
             let (url, server) = session_server(replies);
@@ -568,7 +551,7 @@ mod tests {
         assert!(CorpusClient::new("http://[::1]:7766").is_ok());
         assert!(CorpusClient::new("https://corpus.example").is_err());
         assert!(CorpusClient::new("ws://127.0.0.1:7766").is_err());
-        assert!(CorpusClient::new("http://127.0.0.1:7766/v2").is_err());
+        assert!(CorpusClient::new("http://127.0.0.1:7766/v3").is_err());
         assert!(CorpusClient::new("not a url").is_err());
         assert!(provider_path("my-game").is_ok());
         assert!(provider_path("../other").is_err());

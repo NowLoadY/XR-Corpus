@@ -1,14 +1,14 @@
 //! XR Corpus local HTTP service.
 //!
-//! The service, rather than each inference caller, owns activation state,
-//! bounded bilingual history and immutable per-request context snapshots.
+//! The service owns vocabulary activation, bounded recognition evidence and
+//! immutable vocabulary snapshots. Translation context belongs to callers.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -30,12 +30,10 @@ use xr_corpus_core::{
 use xr_corpus_protocol::{
     API_VERSION, ContextBudgets, CreateSessionRequest, CreateSessionResponse, ErrorResponse,
     HealthResponse, PrepareAsrRequest, PrepareAsrResponse, PrepareTranslationRequest,
-    PrepareTranslationResponse, ProviderSnapshotResponse, PublishProviderRequest,
-    RecordTranslationRequest, RecordTranslationResponse, SegmentContext, SessionStateResponse,
+    PrepareTranslationResponse, ProviderSnapshotResponse, PublishProviderRequest, SegmentContext,
+    SessionStateResponse,
 };
-use xr_corpus_session::{
-    CurrentTurnContext, PromptContextManager, PromptContextSnapshot, SharedDialogueHistory,
-};
+use xr_corpus_session::PromptContextManager;
 
 mod vrcx;
 
@@ -56,7 +54,6 @@ struct Arguments {
 #[derive(Clone)]
 struct AppState {
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<CorpusSession>>>>>,
-    conversations: Arc<Mutex<HashMap<String, Weak<SharedDialogueHistory>>>>,
     catalog: CorpusCatalog,
     graph: GraphStore,
     config: CorpusConfig,
@@ -67,9 +64,8 @@ struct AppState {
 }
 
 struct CorpusSession {
-    input_source: Option<String>,
     manager: PromptContextManager,
-    snapshots: HashMap<u64, PromptContextSnapshot>,
+    snapshots: VecDeque<u64>,
     observed_turn_ids: HashSet<String>,
     observed_turn_order: VecDeque<String>,
     next_context_id: u64,
@@ -77,24 +73,6 @@ struct CorpusSession {
 }
 
 impl CorpusSession {
-    fn context_identity(
-        &self,
-        session_id: &str,
-        turn_id: &Option<String>,
-        speaker_id: &str,
-    ) -> (Option<String>, String) {
-        let Some(source) = &self.input_source else {
-            return (turn_id.clone(), speaker_id.to_owned());
-        };
-        let turn_id = turn_id.as_ref().map(|id| format!("{session_id}/{id}"));
-        let speaker = if speaker_id.trim().is_empty() || speaker_id == "speaker-unknown" {
-            source.clone()
-        } else {
-            format!("{source}/{session_id}/{}", speaker_id.trim())
-        };
-        (turn_id, speaker)
-    }
-
     fn should_advance_topic(&mut self, turn_id: Option<&str>, has_text: bool) -> bool {
         if !has_text {
             return false;
@@ -162,7 +140,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _vrcx_monitor = vrcx.start();
     let state = AppState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
-        conversations: Arc::new(Mutex::new(HashMap::new())),
         catalog,
         graph,
         config: config.prompt_context,
@@ -174,34 +151,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     spawn_session_reaper(state.clone());
     let app = Router::new()
         .route("/healthz", get(health))
-        .route("/v2/graph", get(graph_snapshot))
+        .route("/v3/graph", get(graph_snapshot))
         .route(
-            "/v2/graph/domains/{id}",
+            "/v3/graph/domains/{id}",
             put(upsert_domain).delete(delete_domain),
         )
-        .route("/v2/graph/nodes", put(patch_node_state))
-        .route("/v2/graph/terms/{id}", put(save_term))
-        .route("/v2/graph/terms", post(import_terms).layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)))
-        .route("/v2/graph/nodes/{id}", put(upsert_node).delete(delete_node))
-        .route("/v2/graph/edges", put(upsert_edge).delete(delete_edge))
-        .route("/v2/integrations/vrcx/status", get(vrcx::get_status))
+        .route("/v3/graph/nodes", put(patch_node_state))
+        .route("/v3/graph/terms/{id}", put(save_term))
         .route(
-            "/v2/providers/{provider_id}",
+            "/v3/graph/terms",
+            post(import_terms).layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
+        .route("/v3/graph/nodes/{id}", put(upsert_node).delete(delete_node))
+        .route("/v3/graph/edges", put(upsert_edge).delete(delete_edge))
+        .route("/v3/integrations/vrcx/status", get(vrcx::get_status))
+        .route(
+            "/v3/providers/{provider_id}",
             put(publish_provider).delete(delete_provider),
         )
-        .route("/v2/sessions", post(create_session))
+        .route("/v3/sessions", post(create_session))
         .route(
-            "/v2/sessions/{session_id}",
+            "/v3/sessions/{session_id}",
             get(session_state).delete(delete_session),
         )
-        .route("/v2/sessions/{session_id}/asr", post(prepare_asr))
+        .route("/v3/sessions/{session_id}/asr", post(prepare_asr))
         .route(
-            "/v2/sessions/{session_id}/translation",
+            "/v3/sessions/{session_id}/translation",
             post(prepare_translation),
-        )
-        .route(
-            "/v2/sessions/{session_id}/results",
-            post(record_translation),
         )
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
@@ -258,7 +234,9 @@ async fn import_terms(
     State(state): State<AppState>,
     Json(nodes): Json<Vec<GraphNode>>,
 ) -> ApiResult<GraphSnapshot> {
-    state.graph.import_terms(&nodes)
+    state
+        .graph
+        .import_terms(&nodes)
         .map_err(|message| bad_request("invalid_terms", message))?;
     graph_snapshot(State(state)).await
 }
@@ -339,54 +317,17 @@ async fn delete_edge(
 
 async fn create_session(
     State(state): State<AppState>,
-    Json(request): Json<CreateSessionRequest>,
+    Json(_request): Json<CreateSessionRequest>,
 ) -> ApiResult<CreateSessionResponse> {
     let id = state.next_session_id.fetch_add(1, Ordering::Relaxed);
     let session_id = format!("session-{id}");
-    let mut manager = PromptContextManager::new(state.config.clone(), state.catalog.clone())
+    let manager = PromptContextManager::new(state.config.clone(), state.catalog.clone())
         .map_err(internal_error)?;
-    let input_source = if let Some(conversation_id) = request
-        .conversation_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-    {
-        if conversation_id.len() > 128 || request.input_source.len() > 64 {
-            return Err(bad_request(
-                "invalid_conversation",
-                "Conversation ID or input source is too long",
-            ));
-        }
-        let mut conversations = state.conversations.lock().map_err(lock_error)?;
-        conversations.retain(|_, history| history.strong_count() > 0);
-        let history = conversations
-            .get(conversation_id)
-            .and_then(Weak::upgrade)
-            .unwrap_or_else(|| {
-                let history = Arc::new(SharedDialogueHistory::new(state.config.max_entries));
-                conversations.insert(conversation_id.to_owned(), Arc::downgrade(&history));
-                history
-            });
-        manager.share_dialogue(history);
-        let source = request
-            .input_source
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        Some(if source.is_empty() {
-            session_id.clone()
-        } else {
-            source
-        })
-    } else {
-        None
-    };
     state.sessions.lock().map_err(lock_error)?.insert(
         session_id.clone(),
         Arc::new(Mutex::new(CorpusSession {
-            input_source,
             manager,
-            snapshots: HashMap::new(),
+            snapshots: VecDeque::new(),
             observed_turn_ids: HashSet::new(),
             observed_turn_order: VecDeque::new(),
             next_context_id: 1,
@@ -480,12 +421,11 @@ async fn prepare_asr(
             budgets(request.budgets),
         )
         .map_err(internal_error)?;
-    let context_id = insert_snapshot(&mut session, snapshot.clone());
+    let context_id = insert_snapshot(&mut session);
     Ok(Json(PrepareAsrResponse {
         context_id,
         vocabulary: snapshot.asr_vocabulary().to_vec(),
         prompt: snapshot.asr_prompt(),
-        echo_guard: snapshot.asr_echo_guard().to_vec(),
     }))
 }
 
@@ -497,14 +437,12 @@ async fn prepare_translation(
     let session = find_session(&state, &session_id)?;
     let mut session = session.lock().map_err(lock_error)?;
     session.last_used = Instant::now();
-    if !session.snapshots.contains_key(&request.asr_context_id) {
+    if !session.snapshots.contains(&request.asr_context_id) {
         return Err(bad_request(
             "context_expired",
             "ASR context snapshot has expired",
         ));
     }
-    let (turn_id, speaker_id) =
-        session.context_identity(&session_id, &request.turn_id, &request.speaker_id);
     let advance_topic = session.should_advance_topic(
         request.turn_id.as_deref(),
         !request.recognized_text.trim().is_empty(),
@@ -517,12 +455,11 @@ async fn prepare_translation(
             &[request.recognized_text.as_str()],
             budgets(request.budgets),
             advance_topic,
-            CurrentTurnContext {
-                turn_id: turn_id.as_deref(),
-                speaker_id: &speaker_id,
-                source_text: (request.segments.len() > 1)
-                    .then_some(request.recognized_text.as_str()),
-            },
+            &request
+                .context_evidence
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
         )
         .map_err(internal_error)?;
     let source_corrections = snapshot.recognition_corrections(&request.recognized_text);
@@ -536,7 +473,6 @@ async fn prepare_translation(
             let source_corrections = snapshot.recognition_corrections(text);
             SegmentContext {
                 prompt_terms: snapshot.translation_prompt_terms_for(&text),
-                context_data: snapshot.translation_context_data_for(text),
                 source_corrections,
                 activation_matches: snapshot.activation_matches(&text),
                 context_matches: snapshot.recognition_context_matches(&text),
@@ -544,7 +480,7 @@ async fn prepare_translation(
             }
         })
         .collect();
-    let context_id = insert_snapshot(&mut session, snapshot);
+    let context_id = insert_snapshot(&mut session);
     Ok(Json(PrepareTranslationResponse {
         context_id,
         corrected_text: request.recognized_text,
@@ -553,50 +489,12 @@ async fn prepare_translation(
     }))
 }
 
-async fn record_translation(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    Json(request): Json<RecordTranslationRequest>,
-) -> ApiResult<RecordTranslationResponse> {
-    let session = find_session(&state, &session_id)?;
-    let mut session = session.lock().map_err(lock_error)?;
-    session.last_used = Instant::now();
-    let snapshot = session
-        .snapshots
-        .get(&request.context_id)
-        .cloned()
-        .ok_or_else(|| {
-            bad_request(
-                "context_expired",
-                "translation context snapshot has expired",
-            )
-        })?;
-    let term_matches = snapshot.translation_term_matches(
-        &request.source_text,
-        &request.translated_text,
-        &request.target_language,
-    );
-    let (turn_id, speaker_id) =
-        session.context_identity(&session_id, &request.turn_id, &request.speaker_id);
-    session.manager.record_translation_turn(
-        turn_id.as_deref(),
-        &speaker_id,
-        &request.source_language,
-        &request.target_language,
-        &request.source_text,
-        &request.translated_text,
-    );
-    Ok(Json(RecordTranslationResponse { term_matches }))
-}
-
-fn insert_snapshot(session: &mut CorpusSession, snapshot: PromptContextSnapshot) -> u64 {
+fn insert_snapshot(session: &mut CorpusSession) -> u64 {
     let context_id = session.next_context_id;
     session.next_context_id = session.next_context_id.saturating_add(1);
-    session.snapshots.insert(context_id, snapshot);
-    if session.snapshots.len() > MAX_SNAPSHOTS_PER_SESSION
-        && let Some(oldest) = session.snapshots.keys().min().copied()
-    {
-        session.snapshots.remove(&oldest);
+    session.snapshots.push_back(context_id);
+    if session.snapshots.len() > MAX_SNAPSHOTS_PER_SESSION {
+        session.snapshots.pop_front();
     }
     context_id
 }

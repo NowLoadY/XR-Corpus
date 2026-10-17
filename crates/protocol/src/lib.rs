@@ -6,7 +6,7 @@ pub use xr_corpus_core::{
     GraphDomain, GraphDomainEdit, GraphEdge, GraphEdgeKind, GraphNode, GraphNodeStatePatch,
     GraphSnapshot, GraphTermEdit, RecognitionAlias, RecognitionAliases, VRCX_DOMAIN_ID,
 };
-pub const API_VERSION: u16 = 2;
+pub const API_VERSION: u16 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorpusTermMatch {
@@ -50,15 +50,7 @@ pub struct HealthResponse {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct CreateSessionRequest {
-    /// Explicit opt-in to shared translation history. Recognition and topic
-    /// state remain private to each session; omitted IDs preserve isolation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conversation_id: Option<String>,
-    /// Human-readable input lane, such as microphone, system-audio or text.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub input_source: String,
-}
+pub struct CreateSessionRequest {}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateSessionResponse {
@@ -93,11 +85,9 @@ pub struct PrepareAsrResponse {
     /// provider's weighted vocabulary contract.
     #[serde(default)]
     pub vocabulary: Vec<String>,
-    /// Legacy pre-rendered ASR context retained for older consumers.
+    /// Compact display of the selected recognition vocabulary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
-    #[serde(default)]
-    pub echo_guard: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -107,9 +97,10 @@ pub struct PrepareTranslationRequest {
     /// same utterance reuse this value so topic decay advances only once.
     #[serde(default)]
     pub turn_id: Option<String>,
-    /// Neutral speaker identity assigned by recognition infrastructure.
+    /// Relevant caller-owned context for vocabulary ranking and topic continuity.
+    /// It does not count as a new topic trigger or become retained dialogue.
     #[serde(default)]
-    pub speaker_id: String,
+    pub context_evidence: Vec<String>,
     pub source_language: String,
     pub target_language: String,
     pub recognized_text: String,
@@ -122,56 +113,10 @@ pub struct SegmentContext {
     pub corrected_text: String,
     #[serde(default)]
     pub prompt_terms: Vec<CorpusPromptTerm>,
-    /// Neutral, already-bounded conversation facts. Callers may use these to
-    /// compose a model prompt without depending on XR Corpus's default text
-    /// rendering or internal session types.
-    #[serde(default)]
-    pub context_data: TranslationContextData,
     #[serde(default)]
     pub source_corrections: Vec<CorpusRecognitionCorrection>,
     pub activation_matches: Vec<CorpusTermMatch>,
     pub context_matches: Vec<CorpusTermMatch>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TranslationContextData {
-    /// Identity of the current input in the shared conversation.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub current_speaker_id: String,
-    /// Completed earlier logical turns, oldest first and bounded by the
-    /// session's configured history and model budget.
-    #[serde(default)]
-    pub recent_turns: Vec<BilingualContextTurn>,
-    /// The preceding overlapping window for the same logical speech turn.
-    #[serde(default)]
-    pub previous_revision: Option<BilingualContextTurn>,
-    /// Source text surrounding this exact translation segment. The segment
-    /// itself is intentionally absent so it cannot be translated twice.
-    #[serde(default)]
-    pub surrounding_source: Option<SurroundingSourceContext>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BilingualContextTurn {
-    #[serde(default)]
-    pub turn_id: Option<String>,
-    #[serde(default)]
-    pub speaker_id: String,
-    pub source_language: String,
-    pub target_language: String,
-    pub source_text: String,
-    pub translated_text: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SurroundingSourceContext {
-    #[serde(default)]
-    pub speaker_id: String,
-    pub source_language: String,
-    #[serde(default)]
-    pub before: String,
-    #[serde(default)]
-    pub after: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -181,27 +126,6 @@ pub struct PrepareTranslationResponse {
     #[serde(default)]
     pub source_corrections: Vec<CorpusRecognitionCorrection>,
     pub segments: Vec<SegmentContext>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RecordTranslationRequest {
-    pub context_id: u64,
-    /// Stable logical speech-turn identity. Repeated IDs update the latest
-    /// continuous recognition revision instead of appending overlap as a new
-    /// dialogue turn.
-    #[serde(default)]
-    pub turn_id: Option<String>,
-    #[serde(default)]
-    pub speaker_id: String,
-    pub source_language: String,
-    pub target_language: String,
-    pub source_text: String,
-    pub translated_text: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RecordTranslationResponse {
-    pub term_matches: Vec<CorpusTermMatch>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -255,70 +179,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn logical_turn_metadata_is_backward_compatible() {
-        let request: RecordTranslationRequest = serde_json::from_str(
-            r#"{"context_id":1,"source_language":"en","target_language":"zh","source_text":"hello","translated_text":"你好"}"#,
-        )
-        .unwrap();
-        assert_eq!(request.turn_id, None);
-        assert!(request.speaker_id.is_empty());
-
+    fn optional_context_evidence_defaults_to_empty() {
         let request: PrepareTranslationRequest = serde_json::from_str(
             r#"{"asr_context_id":1,"source_language":"en","target_language":"zh","recognized_text":"hello","segments":["hello"],"budgets":{"asr_tokens":64,"translation_tokens":128}}"#,
-        )
-        .unwrap();
+        ).unwrap();
         assert_eq!(request.turn_id, None);
-        assert!(request.speaker_id.is_empty());
-
-        let response: PrepareAsrResponse = serde_json::from_str(
-            r#"{"context_id":1,"prompt":"Vocabulary: VRChat","echo_guard":[]}"#,
-        )
-        .unwrap();
-        assert!(response.vocabulary.is_empty());
-        assert_eq!(response.prompt.as_deref(), Some("Vocabulary: VRChat"));
-    }
-
-    #[test]
-    fn structured_translation_context_is_serialized_for_translation() {
+        assert!(request.context_evidence.is_empty());
         let segment: SegmentContext = serde_json::from_str(
             r#"{"corrected_text":"hello","activation_matches":[],"context_matches":[]}"#,
         )
         .unwrap();
-        assert_eq!(segment.context_data, TranslationContextData::default());
-
-        let encoded = serde_json::to_value(SegmentContext {
-            corrected_text: "Tell the team.".into(),
-            prompt_terms: Vec::new(),
-            context_data: TranslationContextData {
-                current_speaker_id: String::new(),
-                recent_turns: vec![BilingualContextTurn {
-                    turn_id: Some("previous".into()),
-                    speaker_id: "speaker-01".into(),
-                    source_language: "en".into(),
-                    target_language: "zh".into(),
-                    source_text: "The plan changed.".into(),
-                    translated_text: "计划变了。".into(),
-                }],
-                previous_revision: None,
-                surrounding_source: Some(SurroundingSourceContext {
-                    speaker_id: "speaker-01".into(),
-                    source_language: "en".into(),
-                    before: "If it slips, move it to Friday.".into(),
-                    after: String::new(),
-                }),
-            },
-            source_corrections: Vec::new(),
-            activation_matches: Vec::new(),
-            context_matches: Vec::new(),
-        })
-        .unwrap();
-        assert_eq!(
-            encoded["context_data"]["recent_turns"][0]["turn_id"],
-            "previous"
-        );
-        assert_eq!(
-            encoded["context_data"]["surrounding_source"]["before"],
-            "If it slips, move it to Friday."
-        );
+        assert!(segment.prompt_terms.is_empty());
+        assert!(segment.source_corrections.is_empty());
     }
 }

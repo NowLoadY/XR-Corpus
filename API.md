@@ -1,16 +1,16 @@
-# XR Corpus API v2
+# XR Corpus API v3
 
 XR Corpus is a loopback HTTP service. The default base URL is `http://127.0.0.1:7766`.
-All JSON endpoints live under `/v2`; readiness is available at `/healthz`.
+All JSON endpoints live under `/v3`; readiness is available at `/healthz`.
 
 ## Compatibility and errors
 
-Call `GET /healthz` before creating sessions and require `api_version: 2`. The Rust SDK does this
+Call `GET /healthz` before creating sessions and require `api_version: 3`. The Rust SDK does this
 with `CorpusClient::connect`.
 
 ```sh
 curl http://127.0.0.1:7766/healthz
-curl -X POST -H "Content-Type: application/json" -d "{}" http://127.0.0.1:7766/v2/sessions
+curl -X POST -H "Content-Type: application/json" -d "{}" http://127.0.0.1:7766/v3/sessions
 ```
 
 Errors have a stable machine-readable code and a human-readable message:
@@ -26,54 +26,54 @@ Do not branch on the English `error` text.
 
 ## Inference session lifecycle
 
-1. `POST /v2/sessions` with `{}`.
-2. Before ASR, `POST /v2/sessions/{id}/asr` with languages and model-derived token budgets.
-3. After ASR, `POST /v2/sessions/{id}/translation` with the recognition and its segments.
-4. Translate each returned segment using its structured `context_data`, `prompt_terms`, and
-   shared `context_id`. `context_data` exposes bounded recent turns, the previous streaming
-   revision, and source text surrounding that exact segment. `prompt_terms` supplies relevant
-   structured terminology. These fields are data only; XR Corpus does not own user templates,
-   block ordering, or provider message roles.
-5. Join the successful segments in source order and `POST /v2/sessions/{id}/results` once for the
-   logical speech turn. Send the same `turn_id` on continuous-window revisions; the latest window
-   updates that turn instead of appending overlapping text. `speaker_id` is optional neutral
-   recognition metadata used to label dialogue context.
-6. `DELETE /v2/sessions/{id}` when finished. Abandoned sessions expire automatically.
+1. `POST /v3/sessions` with `{}`.
+2. Before ASR, `POST /v3/sessions/{id}/asr` with languages and model-derived vocabulary token budgets.
+3. After ASR, `POST /v3/sessions/{id}/translation` with the recognition and its segments.
+   Optional `context_evidence` supplies relevant caller-owned text for vocabulary ranking.
+   New topic activation requires current recognition or live runtime facts; external context is
+   neither a new topic trigger nor retained conversation history.
+4. Translate each segment using its `prompt_terms` and `source_corrections`. `activation_matches`
+   and `context_matches` identify the source spans that activated or matched vocabulary.
+   Prompt composition, conversation memory and completed translation results belong to the caller.
+5. `DELETE /v3/sessions/{id}` when finished. Abandoned sessions expire automatically.
+
+Reuse the same `turn_id` for recognition revisions. Topic decay advances once per logical turn,
+and its recognition evidence replaces the preceding revision. `context_evidence` defaults to an
+empty array; a new session has no shared conversation identity.
 
 The Rust SDK's `prepare_asr` takes a mutable session handle. If the server reports
 HTTP 404 with `session_not_found`, it creates a fresh session and retries this
 preparation once. Retain that handle for later turns. Clones already handed to
-in-flight work keep the old session identity; translation and result requests are
-never replayed into a new session with stale context IDs. Expired conversation
-history is not restored. Other errors are returned without retrying.
+in-flight work keep the old session identity; translation preparations are never
+replayed into a new session with stale context IDs. Other errors return without retrying.
 
-`GET /v2/sessions/{id}` exposes active corpus IDs and retained snapshot count for diagnostics.
+`GET /v3/sessions/{id}` exposes active corpus IDs and retained snapshot count for diagnostics.
 Snapshots are immutable and bounded; clients must not reuse old context IDs indefinitely.
 
 ## Vocabulary graph
 
-`GET /v2/graph` returns the editable persistent graph as `domains`, `nodes`,
+`GET /v3/graph` returns the editable persistent graph as `domains`, `nodes`,
 and `edges`. Node positions are arranged automatically by the client and are
 not stored in the corpus database.
 Changes take effect in new ASR and translation selections without restarting the service.
 
-- `PUT /v2/graph/domains/{id}` saves a domain with an optional `parent_id` (`null` for a root)
+- `PUT /v3/graph/domains/{id}` saves a domain with an optional `parent_id` (`null` for a root)
   and `cue_words`: `null` inherits the nearest ancestor's rules, `[]` uses direct matching,
   and a nonempty list activates the domain when any topic word occurs, in any language.
   Optional `inherit_existing: true` makes all terms in this domain and its descendants
   use their domain rules, in the same transaction. Descendants' explicit domain rules remain in place;
   `DELETE` removes a domain only when it has no nodes or children.
-- `PUT /v2/graph/nodes/{id}` saves a node; `DELETE` removes a node but leaves its edges
+- `PUT /v3/graph/nodes/{id}` saves a node; `DELETE` removes a node but leaves its edges
   dormant so they can reconnect if that ID appears again.
-- `PUT /v2/graph/nodes` updates `enabled`, `domain_id`, and/or `inherit_domain` for a nonempty
+- `PUT /v3/graph/nodes` updates `enabled`, `domain_id`, and/or `inherit_domain` for a nonempty
   `ids` array in one transaction. Unknown or duplicate IDs and unknown domains reject
   the entire batch.
-- `PUT /v2/graph/terms/{id}` atomically saves `{node, domain, incoming_edges}`.
+- `PUT /v3/graph/terms/{id}` atomically saves `{node, domain, incoming_edges}`.
   `domain` is an optional new domain containing the term; an existing domain ID is rejected.
   `incoming_edges` replaces that term's incoming edges only. Failure rolls back the entire edit.
-- `POST /v2/graph/terms` imports an array of nodes in one transaction, with a 32 MiB request limit.
+- `POST /v3/graph/terms` imports an array of nodes in one transaction, with a 32 MiB request limit.
   Existing or repeated IDs reject the whole batch; existing terms are never overwritten.
-- `PUT /v2/graph/edges` saves an edge; `DELETE /v2/graph/edges` with the edge as JSON
+- `PUT /v3/graph/edges` saves an edge; `DELETE /v3/graph/edges` with the edge as JSON
   removes it.
 
 Mutations return the current complete graph. IDs in URL paths must match the JSON body.
@@ -114,8 +114,8 @@ External programs publish current room names, player names, project terminology,
 short-lived information with:
 
 ```text
-PUT /v2/providers/{provider-id}
-DELETE /v2/providers/{provider-id}
+PUT /v3/providers/{provider-id}
+DELETE /v3/providers/{provider-id}
 ```
 
 Each `PUT` atomically replaces that provider's complete snapshot. Runtime snapshots require a TTL
@@ -152,7 +152,7 @@ remain empty columns. The Rust types validate schema IDs, column count, limits, 
 - The service binds to loopback only.
 - Provider replacement is atomic.
 - Dynamic provider data expires by TTL.
-- Session history and context snapshots are bounded.
+- Recognition evidence and vocabulary snapshots are bounded.
 - Prompt budgets come from the active ASR and translation models, not hard-coded model names.
 - Persistent graph nodes and dynamic providers enter the same ranking and activation pipeline.
 
@@ -164,5 +164,4 @@ The canonical word must occur in the corpus terminology. An explicit empty array
 correction aliases; omission preserves the legacy `trigger_aliases` interpretation. Persisted
 graph projections always provide this field, so removing a migrated alias cannot resurrect it
 through old activation edges. Activation topics, canonical hotwords and correction spellings
-remain separate. Ambiguous active mappings are not applied. ASR and translation response
-contracts are unchanged.
+remain separate. Ambiguous active mappings are not applied. Canonical words alone enter the recognition vocabulary.
