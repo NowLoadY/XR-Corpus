@@ -6,10 +6,10 @@
 //! context guide vocabulary selection; full sentences never enter ASR prompts.
 
 mod evidence;
+mod matching;
 
 use std::collections::{HashMap, HashSet};
 
-use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 use xr_corpus_core::{
     CORPUS_LANGUAGE_ORDER, CorpusActivation, CorpusCatalog, CorpusConfig as PromptContextConfig,
     CorpusDefinition, CorpusTerm, language_index,
@@ -19,6 +19,7 @@ use xr_corpus_protocol::{
 };
 
 use evidence::TranscriptHistory;
+use matching::{FoldedText, evidence_contains_term, fold_for_match, match_key, term_spans};
 
 const MAX_EVIDENCE_TEXT_CHARS: usize = 240;
 const ACTIVE_CORPUS_IDLE_TURN_LIMIT: u8 = 3;
@@ -944,7 +945,7 @@ fn selected_recognition_correction_rows(
                 if values_equal(alias, &rule.canonical) {
                     continue;
                 }
-                let key = (rule.language.clone(), fold_for_match(alias));
+                let key = (rule.language.clone(), match_key(alias));
                 let source = CorpusTermSource {
                     corpus_id: corpus.definition.id.clone(),
                     domain: corpus.definition.domain.clone(),
@@ -970,7 +971,7 @@ fn selected_recognition_correction_rows(
             }
         }
     }
-    rows.retain(|row| !ambiguous.contains(&(row.language.clone(), fold_for_match(&row.alias))));
+    rows.retain(|row| !ambiguous.contains(&(row.language.clone(), match_key(&row.alias))));
     rows
 }
 
@@ -1113,24 +1114,6 @@ fn select_translation_terms(
     selected
 }
 
-fn term_spans(text: &str, term: &str) -> Vec<(usize, usize)> {
-    let folded_text = FoldedText::new(text);
-    let folded_value = fold_for_match(term);
-    if folded_value.is_empty() {
-        return Vec::new();
-    }
-    folded_text
-        .text
-        .match_indices(&folded_value)
-        .filter_map(|(folded_start, _)| {
-            let folded_end = folded_start + folded_value.len();
-            term_boundary_matches(&folded_text.text, folded_start, folded_end, &folded_value)
-                .then(|| folded_text.original_span(folded_start, folded_end))
-                .flatten()
-        })
-        .collect()
-}
-
 fn select_non_overlapping_corrections(
     mut corrections: Vec<CorpusRecognitionCorrection>,
 ) -> Vec<CorpusRecognitionCorrection> {
@@ -1168,23 +1151,10 @@ fn match_selected_terms(
             {
                 continue;
             }
-            let folded_value = fold_for_match(value);
-            if folded_value.is_empty() || !seen_values.insert(folded_value.clone()) {
+            if !seen_values.insert(match_key(value)) {
                 continue;
             }
-            for (folded_start, _) in folded_text.text.match_indices(&folded_value) {
-                let folded_end = folded_start + folded_value.len();
-                if !term_boundary_matches(
-                    &folded_text.text,
-                    folded_start,
-                    folded_end,
-                    &folded_value,
-                ) {
-                    continue;
-                }
-                let Some((start, end)) = folded_text.original_span(folded_start, folded_end) else {
-                    continue;
-                };
+            for (start, end) in folded_text.spans(value) {
                 let (Ok(start_byte), Ok(end_byte)) = (u32::try_from(start), u32::try_from(end))
                 else {
                     continue;
@@ -1225,78 +1195,6 @@ fn match_selected_terms(
     }
     matches.sort_by_key(|term_match| term_match.start_byte);
     matches
-}
-
-fn fold_for_match(value: &str) -> String {
-    value
-        .nfkd()
-        .filter(|character| !is_combining_mark(*character))
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-struct FoldedText {
-    text: String,
-    original_boundaries: Vec<Option<usize>>,
-}
-
-impl FoldedText {
-    fn new(value: &str) -> Self {
-        let mut text = String::new();
-        let mut original_boundaries = vec![Some(0)];
-        for (original_start, character) in value.char_indices() {
-            let original_end = original_start + character.len_utf8();
-            let folded = fold_for_match(&character.to_string());
-            if folded.is_empty() {
-                if let Some(boundary) = original_boundaries.last_mut() {
-                    *boundary = Some(original_end);
-                }
-                continue;
-            }
-            if let Some(boundary) = original_boundaries.last_mut() {
-                *boundary = Some(original_start);
-            }
-            text.push_str(&folded);
-            original_boundaries.resize(text.len() + 1, None);
-            original_boundaries[text.len()] = Some(original_end);
-        }
-        Self {
-            text,
-            original_boundaries,
-        }
-    }
-
-    fn original_span(&self, start: usize, end: usize) -> Option<(usize, usize)> {
-        let original_start = self.original_boundaries.get(start).copied().flatten()?;
-        let original_end = self.original_boundaries.get(end).copied().flatten()?;
-        Some((original_start, original_end))
-    }
-}
-
-fn evidence_contains_term(evidence: &str, term: &str) -> bool {
-    if term.is_empty() {
-        return false;
-    }
-    evidence
-        .match_indices(term)
-        .any(|(start, _)| term_boundary_matches(evidence, start, start + term.len(), term))
-}
-
-fn term_boundary_matches(text: &str, start: usize, end: usize, value: &str) -> bool {
-    if !value.is_ascii() {
-        return true;
-    }
-    let starts_with_word = value.chars().next().is_some_and(char::is_alphanumeric);
-    let ends_with_word = value.chars().next_back().is_some_and(char::is_alphanumeric);
-    let before_is_word = text[..start]
-        .chars()
-        .next_back()
-        .is_some_and(char::is_alphanumeric);
-    let after_is_word = text[end..]
-        .chars()
-        .next()
-        .is_some_and(char::is_alphanumeric);
-    (!starts_with_word || !before_is_word) && (!ends_with_word || !after_is_word)
 }
 
 fn within_prompt_budget(prompt: &str, char_budget: usize, token_budget: usize) -> bool {

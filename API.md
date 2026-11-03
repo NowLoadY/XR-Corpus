@@ -100,6 +100,12 @@ between their members. A domain may contain more than the 512-term limit used fo
 payloads. Topic words enter activation through `topic_words` only; they are never offered as
 translations or recognition corrections. Prompt vocabulary remains relevance- and budget-limited.
 
+Activation, vocabulary selection, corrections and highlights share case/accent/width folding.
+Spaces and hyphens between letters may be omitted or inserted by recognition; word boundaries,
+sentence punctuation, line breaks and numeric separators remain significant. Returned spans use
+original UTF-8 byte offsets. Active aliases that normalize alike but name different canonical words
+are ambiguous and do not produce corrections.
+
 The database is `runtime/xr-corpus.sqlite`, initialized once from the packaged
 `corpora/default.sqlite`. Stop XRTranslate before copying the user database to another
 installation. The service keeps the user database across ordinary application updates.
