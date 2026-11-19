@@ -2030,10 +2030,42 @@ mod tests {
         assert!(!prompt.contains("生成式人工智能,generative AI"));
     }
 
+    fn seed_catalog(enabled_roots: &[&str]) -> (tempfile::TempDir, CorpusCatalog) {
+        let directory = tempfile::tempdir().unwrap();
+        let config = PromptContextConfig {
+            seed_database_path: "seed.sqlite".into(),
+            ..Default::default()
+        };
+        std::fs::write(
+            directory.path().join(&config.seed_database_path),
+            include_bytes!("../../../corpora/default.sqlite"),
+        )
+        .unwrap();
+        let catalog = CorpusCatalog::load(&config, directory.path()).unwrap();
+        let graph = catalog.graph_store().unwrap();
+        let domains = graph.snapshot().unwrap().domains;
+        for &id in enabled_roots {
+            let mut domain = domains.iter().find(|d| d.id == id).unwrap().clone();
+            domain.enabled = true;
+            graph.upsert_domain(&domain).unwrap();
+        }
+        (directory, catalog)
+    }
+
+    #[test]
+    fn seed_domains_require_opt_in_before_spoken_terms_activate() {
+        let (_dir, catalog) = seed_catalog(&[]);
+        let mut context = PromptContextManager::new(config(), catalog).unwrap();
+        let snapshot = context
+            .select("auto", "zh,en", &["I use FBT."], (1_000, 1_000))
+            .unwrap();
+        assert!(snapshot.activation_matches("I use FBT.").is_empty());
+        assert!(snapshot.translation_prompt().is_none());
+    }
+
     #[test]
     fn checked_in_research_aliases_activate_on_essay_and_citation_language() {
-        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
+        let (_dir, catalog) = seed_catalog(&["education-and-science"]);
 
         let mut essay_context = PromptContextManager::new(config(), catalog.clone()).unwrap();
         let essay = essay_context
@@ -2065,39 +2097,33 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_vrc_alias_does_not_activate_avatar_authoring_terms() {
-        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
-        let mut casual = PromptContextManager::new(config(), catalog.clone()).unwrap();
-
-        let casual_snapshot = casual
-            .select("auto", "zh,en", &["Let's meet in VRC"], (1_000, 1_000))
+    fn checked_in_vrc_platform_mention_and_community_triggers_are_distinct() {
+        let (_dir, catalog) = seed_catalog(&["virtual-worlds"]);
+        for phrase in ["Let's meet in VRC", "I play VRChat"] {
+            let mut context = PromptContextManager::new(config(), catalog.clone()).unwrap();
+            let snapshot = context
+                .select("auto", "zh,en", &[phrase], (1_000, 1_000))
+                .unwrap();
+            assert!(snapshot.activation_matches(phrase).is_empty(), "{phrase}");
+            assert!(snapshot.translation_prompt().is_none(), "{phrase}");
+        }
+        let mut context = PromptContextManager::new(config(), catalog).unwrap();
+        let phrase = "I use FBT in VRC";
+        let snapshot = context
+            .select("auto", "zh,en", &[phrase], (1_000, 1_000))
             .unwrap();
-        let casual_prompt = casual_snapshot.translation_prompt().unwrap();
-        assert!(casual_prompt.contains("男娘,femboy"));
-        assert!(!casual_prompt.contains("Avatar Dynamics"));
-
-        let mut authoring = PromptContextManager::new(config(), catalog).unwrap();
-        let authoring_snapshot = authoring
-            .select(
-                "auto",
-                "zh,en",
-                &["My VRChat Avatar has broken PhysBones"],
-                (1_000, 1_000),
-            )
-            .unwrap();
+        assert_eq!(snapshot.activation_matches(phrase)[0].text, "FBT");
         assert!(
-            authoring_snapshot
+            snapshot
                 .translation_prompt()
                 .unwrap()
-                .contains("Avatar Dynamics")
+                .contains("面部追踪,face tracking")
         );
     }
 
     #[test]
     fn checked_in_vrc_alias_can_correct_rare_word_on_first_turn() {
-        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
+        let (_dir, catalog) = seed_catalog(&["virtual-worlds"]);
         let mut context = PromptContextManager::new(config(), catalog).unwrap();
 
         let snapshot = context
@@ -2126,8 +2152,7 @@ mod tests {
 
     #[test]
     fn checked_in_lgbtq_spelled_letters_activate_identity_terms() {
-        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
+        let (_dir, catalog) = seed_catalog(&["identity-and-community"]);
         let mut context = PromptContextManager::new(config(), catalog).unwrap();
 
         let snapshot = context
@@ -2147,8 +2172,7 @@ mod tests {
 
     #[test]
     fn checked_in_chinese_meme_seed_activates_small_teasing_cluster() {
-        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
+        let (_dir, catalog) = seed_catalog(&["internet-culture"]);
         let mut context = PromptContextManager::new(config(), catalog).unwrap();
 
         let snapshot = context
@@ -2168,8 +2192,7 @@ mod tests {
 
     #[test]
     fn checked_in_chinese_meme_corpus_ignores_ordinary_teasing() {
-        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
+        let (_dir, catalog) = seed_catalog(&["internet-culture"]);
         let mut context = PromptContextManager::new(config(), catalog).unwrap();
 
         let snapshot = context
@@ -2186,8 +2209,7 @@ mod tests {
 
     #[test]
     fn checked_in_chinese_meme_alias_activates_without_becoming_prompt_term() {
-        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
+        let (_dir, catalog) = seed_catalog(&["internet-culture"]);
         let mut context = PromptContextManager::new(config(), catalog).unwrap();
 
         let snapshot = context
@@ -2205,8 +2227,7 @@ mod tests {
 
     #[test]
     fn checked_in_work_corpus_activates_from_title_or_character() {
-        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
+        let (_dir, catalog) = seed_catalog(&["entertainment"]);
 
         let mut from_title = PromptContextManager::new(config(), catalog.clone()).unwrap();
         let title_snapshot = from_title
@@ -2227,8 +2248,7 @@ mod tests {
 
     #[test]
     fn checked_in_work_corpus_activates_from_non_route_language_alias() {
-        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
+        let (_dir, catalog) = seed_catalog(&["entertainment"]);
 
         let mut from_japanese = PromptContextManager::new(config(), catalog.clone()).unwrap();
         let japanese_snapshot = from_japanese
@@ -2260,8 +2280,7 @@ mod tests {
 
     #[test]
     fn checked_in_active_work_title_remains_recognition_context() {
-        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
+        let (_dir, catalog) = seed_catalog(&["entertainment"]);
         let mut context = PromptContextManager::new(config(), catalog).unwrap();
 
         let first = context
@@ -2384,42 +2403,17 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_catalog_does_not_activate_vrchat_community_language_without_evidence_or_runtime()
-    {
-        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let catalog = CorpusCatalog::load(&PromptContextConfig::default(), &project_root).unwrap();
-        // Keep the vocabulary fixture while giving this runtime-provider test
-        // its own enabled provider registry, independent of local preferences.
-        let catalog = CorpusCatalog::from_definitions(catalog.snapshot().unwrap()).unwrap();
+    fn checked_in_runtime_game_mode_contributes_only_matching_vocabulary() {
+        let (_dir, catalog) = seed_catalog(&["virtual-worlds", "vrcx"]);
+        let greeting = "Hello, how are you today?";
         let mut context = PromptContextManager::new(config(), catalog.clone()).unwrap();
-
-        // 1. Unrelated speech when VRChat is not running: VRChat community language is NOT active.
-        let snapshot = context
-            .select(
-                "auto",
-                "zh,en",
-                &["Hello, how are you today?"],
-                (1_000, 1_000),
-            )
-            .unwrap();
-        let prompt = snapshot.translation_prompt();
-        if let Some(prompt_text) = prompt {
-            assert!(
-                !prompt_text.contains("男娘,femboy"),
-                "VRChat community language should not activate on unrelated speech"
-            );
-            assert!(
-                !prompt_text.contains("面部追踪,face tracking"),
-                "face tracking should not activate on unrelated speech"
-            );
-        }
-        // Entry platform term VRChat is not active on unrelated speech when not running VRChat.
-        let asr = snapshot.asr_prompt();
-        if let Some(asr_text) = asr {
-            assert!(!asr_text.contains("VRChat"));
-        }
-
-        // 2. When VRCX publishes runtime game mode (VRChat running): community language (like 男娘) IS active by default.
+        assert!(
+            context
+                .select("auto", "zh,en", &[greeting], (1_000, 1_000))
+                .unwrap()
+                .translation_prompt()
+                .is_none()
+        );
         catalog
             .dynamic_source()
             .replace_snapshot(
@@ -2434,23 +2428,21 @@ mod tests {
                 None,
             )
             .unwrap();
-        let mut running_context = PromptContextManager::new(config(), catalog).unwrap();
-        let running_snapshot = running_context
-            .select(
-                "auto",
-                "zh,en",
-                &["Hello, how are you today?"],
-                (1_000, 1_000),
-            )
+        let snapshot = context
+            .select("auto", "zh,en", &[greeting], (1_000, 1_000))
             .unwrap();
-        let running_prompt = running_snapshot.translation_prompt().unwrap();
+        let prompt = snapshot.translation_prompt().unwrap();
+        assert!(prompt.contains("VRChat,VRChat"));
+        assert!(!prompt.contains("男娘,femboy"));
+        assert!(!prompt.contains("摸摸,headpat"));
+        let explicit = context
+            .select("auto", "zh,en", &["I use FBT."], (1_000, 1_000))
+            .unwrap();
         assert!(
-            running_prompt.contains("男娘,femboy"),
-            "VRChat running mode should activate community language by default"
-        );
-        assert!(
-            running_prompt.contains("摸摸,headpat"),
-            "VRChat running mode should activate community language by default"
+            explicit
+                .translation_prompt()
+                .unwrap()
+                .contains("摸摸,headpat")
         );
     }
 }
