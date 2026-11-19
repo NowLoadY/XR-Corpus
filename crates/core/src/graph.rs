@@ -12,7 +12,9 @@ use std::{
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-use crate::{CORPUS_SCHEMA, CorpusActivation, CorpusDefinition, CorpusTerm, VRCX_DOMAIN_ID};
+use crate::{
+    CORPUS_SCHEMA, CorpusActivation, CorpusDefinition, CorpusTerm, VRCX_DOMAIN_ID, is_wordbook_id,
+};
 
 const DATABASE_VERSION: i64 = 6;
 static NEXT_SEED_FILE: AtomicU64 = AtomicU64::new(1);
@@ -119,6 +121,7 @@ pub(crate) struct GraphProjection {
 
 struct StoreState {
     database: Connection,
+    wordbooks: GraphSnapshot,
     snapshot: GraphSnapshot,
     projection: Arc<GraphProjection>,
 }
@@ -189,10 +192,17 @@ impl GraphStore {
             )
             .map_err(|error| format!("cannot register VRCX domain: {error}"))?;
         let snapshot = read_snapshot(&database)?;
+        database
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS wordbook_switches (
+            id TEXT PRIMARY KEY, enabled INTEGER NOT NULL)",
+            )
+            .map_err(|e| e.to_string())?;
         let projection = Arc::new(project(&snapshot)?);
         Ok(Self {
             state: Arc::new(Mutex::new(StoreState {
                 database,
+                wordbooks: GraphSnapshot::default(),
                 snapshot,
                 projection,
             })),
@@ -218,10 +228,44 @@ impl GraphStore {
     }
 
     pub fn upsert_domain(&self, domain: &GraphDomain) -> Result<(), String> {
-        self.edit(|transaction| write_domain(transaction, domain))
+        self.save_domain_rules(&GraphDomainEdit {
+            domain: domain.clone(),
+            inherit_existing: false,
+        })
     }
 
     pub fn save_domain_rules(&self, edit: &GraphDomainEdit) -> Result<(), String> {
+        if is_wordbook_id(&edit.domain.id) {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| "graph store lock is poisoned".to_owned())?;
+            let current = state
+                .snapshot
+                .domains
+                .iter()
+                .find(|domain| domain.id == edit.domain.id)
+                .ok_or("Wordbook no longer exists")?;
+            if edit.inherit_existing
+                || edit.domain
+                    != (GraphDomain {
+                        enabled: edit.domain.enabled,
+                        ..current.clone()
+                    })
+            {
+                return Err("Edit this wordbook in Vocabulary".into());
+            }
+            drop(state);
+            return self.edit(|tx| {
+                tx.execute(
+                    "INSERT INTO wordbook_switches(id,enabled) VALUES(?1,?2)
+                ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled",
+                    params![edit.domain.id, edit.domain.enabled],
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            });
+        }
         self.edit(|transaction| {
             write_domain(transaction, &edit.domain)?;
             if edit.inherit_existing {
@@ -366,6 +410,9 @@ impl GraphStore {
     }
 
     pub fn delete_domain(&self, id: &str) -> Result<(), String> {
+        if is_wordbook_id(id) {
+            return Err("Edit this wordbook in Vocabulary".into());
+        }
         if id == VRCX_DOMAIN_ID {
             return Err("VRCX runtime domain cannot be deleted".into());
         }
@@ -400,6 +447,9 @@ impl GraphStore {
     }
 
     pub fn delete_node(&self, id: &str) -> Result<(), String> {
+        if is_wordbook_id(id) {
+            return Err("Edit this word in Vocabulary".into());
+        }
         self.edit(|transaction| {
             transaction
                 .execute("DELETE FROM nodes WHERE id=?1", [id])
@@ -425,6 +475,19 @@ impl GraphStore {
         })
     }
 
+    /// Replace the read-only archive view. Only domain switches live in this database.
+    pub fn replace_wordbooks(&self, wordbooks: GraphSnapshot) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "graph store lock is poisoned".to_owned())?;
+        let (snapshot, projection) = combined_view(&state.database, &wordbooks, &state.projection)?;
+        state.wordbooks = wordbooks;
+        state.snapshot = snapshot;
+        state.projection = projection;
+        Ok(())
+    }
+
     fn edit(
         &self,
         action: impl FnOnce(&Transaction<'_>) -> Result<(), String>,
@@ -433,29 +496,66 @@ impl GraphStore {
             .state
             .lock()
             .map_err(|_| "graph store lock is poisoned".to_owned())?;
-        let previous = state.projection.clone();
-        let transaction = state
-            .database
+        let StoreState {
+            database,
+            wordbooks,
+            projection,
+            snapshot,
+        } = &mut *state;
+        let transaction = database
             .transaction()
             .map_err(|error| format!("cannot start graph edit: {error}"))?;
         action(&transaction)?;
-        let snapshot = read_snapshot(&transaction)?;
-        let mut projection = project(&snapshot)?;
-        projection.revision = previous.revision
-            + u64::from(
-                projection.corpora != previous.corpora
-                    || projection.disabled_domains != previous.disabled_domains,
-            );
+        let (new_snapshot, new_projection) = combined_view(&transaction, wordbooks, projection)?;
         transaction
             .commit()
             .map_err(|error| format!("cannot commit graph edit: {error}"))?;
-        state.snapshot = snapshot;
-        state.projection = Arc::new(projection);
+        *snapshot = new_snapshot;
+        *projection = new_projection;
         Ok(())
     }
 }
 
+fn combined_view(
+    database: &Connection,
+    wordbooks: &GraphSnapshot,
+    previous: &GraphProjection,
+) -> Result<(GraphSnapshot, Arc<GraphProjection>), String> {
+    let mut snapshot = read_snapshot(database)?;
+    if !wordbooks.domains.is_empty() {
+        let switches = database
+            .prepare_cached("SELECT id,enabled FROM wordbook_switches")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+                })?
+                .collect::<rusqlite::Result<HashMap<_, _>>>()
+            })
+            .map_err(|e| e.to_string())?;
+        snapshot
+            .domains
+            .extend(wordbooks.domains.iter().cloned().map(|mut domain| {
+                if let Some(enabled) = switches.get(&domain.id) {
+                    domain.enabled = *enabled;
+                }
+                domain
+            }));
+        snapshot.nodes.extend_from_slice(&wordbooks.nodes);
+        snapshot.nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    }
+    let mut projection = project(&snapshot)?;
+    projection.revision = previous.revision
+        + u64::from(
+            projection.corpora != previous.corpora
+                || projection.disabled_domains != previous.disabled_domains,
+        );
+    Ok((snapshot, Arc::new(projection)))
+}
+
 fn write_domain(transaction: &Transaction<'_>, domain: &GraphDomain) -> Result<(), String> {
+    if is_wordbook_id(&domain.id) || domain.parent_id.as_deref().is_some_and(is_wordbook_id) {
+        return Err("Edit this wordbook in Vocabulary".into());
+    }
     check_id(&domain.id, "domain ID")?;
     check_title(&domain.title, "domain title")?;
     if let Some(parent_id) = &domain.parent_id {
@@ -496,6 +596,9 @@ fn write_domain(transaction: &Transaction<'_>, domain: &GraphDomain) -> Result<(
 }
 
 fn write_node(transaction: &Transaction<'_>, node: &GraphNode) -> Result<(), String> {
+    if is_wordbook_id(&node.id) || is_wordbook_id(&node.domain_id) {
+        return Err("Edit this word in Vocabulary".into());
+    }
     check_id(&node.id, "node ID")?;
     check_id(&node.domain_id, "node domain ID")?;
     check_title(&node.title, "node title")?;
@@ -514,7 +617,7 @@ fn write_node(transaction: &Transaction<'_>, node: &GraphNode) -> Result<(), Str
         .collect();
     let aliases = serde_json::to_string(&aliases)
         .map_err(|error| format!("cannot encode recognition aliases: {error}"))?;
-    let values = serde_json::to_string(&node.values)
+    let values = serde_json::to_string(compact_columns(&node.values))
         .map_err(|error| format!("cannot encode node values: {error}"))?;
 
     transaction
@@ -1302,11 +1405,16 @@ pub(crate) fn check_id(value: &str, label: &str) -> Result<(), String> {
 }
 
 fn normalized_values(values: &[String]) -> String {
-    values
+    compact_columns(values)
         .iter()
         .map(|value| value.trim().to_lowercase())
         .collect::<Vec<_>>()
         .join("\u{1f}")
+}
+
+fn compact_columns(values: &[String]) -> &[String] {
+    let used = values.iter().rposition(|value| !value.trim().is_empty()).map_or(0, |index| index + 1);
+    &values[..used.max(crate::BASE_LANGUAGE_COLUMNS).min(values.len())]
 }
 
 fn dedup_sources<'a>(sources: &mut Vec<&'a GraphNode>, normalized: &HashMap<&str, String>) {

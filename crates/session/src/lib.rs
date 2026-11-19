@@ -1038,9 +1038,10 @@ fn task_term_values(term: &CorpusTerm, languages: &[String]) -> Vec<(String, Str
 fn all_term_values(term: &CorpusTerm) -> Vec<(String, String)> {
     CORPUS_LANGUAGE_ORDER
         .iter()
-        .filter_map(|language| {
-            term.value(language)
-                .map(|value| ((*language).to_owned(), value.to_owned()))
+        .zip(&term.ordered_values)
+        .filter_map(|(language, value)| {
+            let value = value.trim();
+            (!value.is_empty()).then(|| ((*language).to_owned(), value.to_owned()))
         })
         .collect()
 }
@@ -1052,7 +1053,12 @@ fn values_equal(left: &str, right: &str) -> bool {
 fn selected_term_row(term: &CorpusTerm, languages: &[String]) -> String {
     languages
         .iter()
-        .map(|language| term.value(language).unwrap_or_default())
+        .map(|language| match term.value(language).unwrap_or_default() {
+            value if value.contains([',', '"']) => {
+                std::borrow::Cow::Owned(format!("\"{}\"", value.replace('"', "\"\"")))
+            }
+            value => std::borrow::Cow::Borrowed(value),
+        })
         .collect::<Vec<_>>()
         .join(",")
 }

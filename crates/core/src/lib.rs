@@ -20,9 +20,22 @@ use std::{
 use serde::{Deserialize, Serialize};
 pub const CORPUS_SCHEMA: &str = "xrtranslate-corpus/v1";
 pub const VRCX_DOMAIN_ID: &str = "vrcx";
+pub const WORDBOOK_DOMAIN_ID: &str = "xrtranslate.wordbooks";
+
+pub fn is_wordbook_id(id: &str) -> bool {
+    id == WORDBOOK_DOMAIN_ID
+        || id
+            .strip_prefix(WORDBOOK_DOMAIN_ID)
+            .is_some_and(|tail| tail.starts_with('.'))
+}
 pub const CORPUS_LANGUAGE_ORDER: &[&str] = &[
     "zh", "en", "fr", "pt", "es", "ja", "ru", "ko", "th", "it", "de", "vi", "id", "pl", "cs", "nl",
+    "hi", "bg", "yue", "ar", "tr", "ms", "sv", "da", "fi", "fil", "tl", "fa", "el", "hu", "mk",
+    "ro", "km", "my", "gu", "ur", "te", "mr", "he", "bn", "ta", "uk", "bo", "kk", "mn", "ug",
+    "af", "no", "hr", "sk",
 ];
+/// The original on-disk and API layout. Later language columns are an optional suffix.
+pub const BASE_LANGUAGE_COLUMNS: usize = 16;
 const MAX_TRIGGERS: usize = 128;
 const MAX_TERMS: usize = 512;
 const MAX_ITEM_CHARS: usize = 512;
@@ -130,9 +143,10 @@ impl CorpusTerm {
     }
 
     pub(crate) fn validate(&self, label: &str) -> Result<(), String> {
-        if self.ordered_values.len() != CORPUS_LANGUAGE_ORDER.len() {
+        if !(BASE_LANGUAGE_COLUMNS..=CORPUS_LANGUAGE_ORDER.len()).contains(&self.ordered_values.len())
+        {
             return Err(format!(
-                "{label} has {} language columns; expected {} in order {}",
+                "{label} has {} language columns; expected {BASE_LANGUAGE_COLUMNS} to {} in order {}",
                 self.ordered_values.len(),
                 CORPUS_LANGUAGE_ORDER.len(),
                 CORPUS_LANGUAGE_ORDER.join(",")
@@ -146,13 +160,10 @@ impl CorpusTerm {
             return Err(format!("{label} has no value in any language"));
         }
         if self.ordered_values.iter().any(|value| {
-            value.contains(',')
-                || value.contains('\r')
-                || value.contains('\n')
-                || value.chars().count() > MAX_ITEM_CHARS
+            value.contains(['\r', '\n']) || value.chars().count() > MAX_ITEM_CHARS
         }) {
             return Err(format!(
-                "{label} contains a comma, newline, or value longer than {MAX_ITEM_CHARS} characters"
+                "{label} contains a newline or a value longer than {MAX_ITEM_CHARS} characters"
             ));
         }
         Ok(())

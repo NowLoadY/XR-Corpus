@@ -36,6 +36,7 @@ use xr_corpus_protocol::{
 use xr_corpus_session::PromptContextManager;
 
 mod vrcx;
+mod wordbooks;
 
 const MAX_SNAPSHOTS_PER_SESSION: usize = 12;
 const MAX_OBSERVED_TURNS_PER_SESSION: usize = 64;
@@ -49,6 +50,8 @@ struct Arguments {
     listen: SocketAddr,
     #[arg(long, default_value_t = 900)]
     session_idle_seconds: u64,
+    #[arg(long)]
+    wordbooks: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -56,11 +59,25 @@ struct AppState {
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<CorpusSession>>>>>,
     catalog: CorpusCatalog,
     graph: GraphStore,
+    wordbooks: Option<Arc<Mutex<wordbooks::Wordbooks>>>,
     config: CorpusConfig,
     next_session_id: Arc<AtomicU64>,
     session_ttl: Duration,
     dynamic_source: DynamicCorpusSource,
     vrcx: vrcx::VrcxRuntimeSource,
+}
+
+impl AppState {
+    fn refresh_wordbooks(&self) {
+        if let Some(source) = &self.wordbooks
+            && let Err(error) = source
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .refresh(&self.graph)
+        {
+            warn!(%error, "Could not refresh wordbooks");
+        }
+    }
 }
 
 struct CorpusSession {
@@ -142,6 +159,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         catalog,
         graph,
+        wordbooks: args
+            .wordbooks
+            .map(|path| Arc::new(Mutex::new(wordbooks::Wordbooks::new(path)))),
         config: config.prompt_context,
         next_session_id: Arc::new(AtomicU64::new(1)),
         session_ttl: Duration::from_secs(args.session_idle_seconds.max(30)),
@@ -201,6 +221,7 @@ async fn health(State(state): State<AppState>) -> ApiResult<HealthResponse> {
 }
 
 async fn graph_snapshot(State(state): State<AppState>) -> ApiResult<GraphSnapshot> {
+    state.refresh_wordbooks();
     Ok(Json(state.graph.snapshot().map_err(internal_error)?))
 }
 
@@ -409,6 +430,7 @@ async fn prepare_asr(
     Path(session_id): Path<String>,
     Json(request): Json<PrepareAsrRequest>,
 ) -> ApiResult<PrepareAsrResponse> {
+    state.refresh_wordbooks();
     let session = find_session(&state, &session_id)?;
     let mut session = session.lock().map_err(lock_error)?;
     session.last_used = Instant::now();
@@ -434,6 +456,7 @@ async fn prepare_translation(
     Path(session_id): Path<String>,
     Json(request): Json<PrepareTranslationRequest>,
 ) -> ApiResult<PrepareTranslationResponse> {
+    state.refresh_wordbooks();
     let session = find_session(&state, &session_id)?;
     let mut session = session.lock().map_err(lock_error)?;
     session.last_used = Instant::now();

@@ -5,6 +5,7 @@ pub use xr_corpus_core::{
     CORPUS_LANGUAGE_ORDER, CORPUS_SCHEMA, CorpusActivation, CorpusDefinition, CorpusTerm,
     GraphDomain, GraphDomainEdit, GraphEdge, GraphEdgeKind, GraphNode, GraphNodeStatePatch,
     GraphSnapshot, GraphTermEdit, RecognitionAlias, RecognitionAliases, VRCX_DOMAIN_ID,
+    WORDBOOK_DOMAIN_ID, is_wordbook_id,
 };
 pub const API_VERSION: u16 = 3;
 

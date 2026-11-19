@@ -77,7 +77,8 @@ Changes take effect in new ASR and translation selections without restarting the
   removes it.
 
 Mutations return the current complete graph. IDs in URL paths must match the JSON body.
-Nodes belong to one domain in the tree and require exactly sixteen ordered language values.
+Nodes belong to one domain in the tree. Their language values start with the sixteen base columns.
+Additional languages use the optional columns in `CORPUS_LANGUAGE_ORDER`.
 The runtime corpus `subdomain` is derived from the first child below the root domain. `activation`
 is `always` or `on-evidence`; `promptable` controls whether a node can enter recognition
 and translation context. A node with `inherit_domain: true` uses the effective domain rules
@@ -150,8 +151,13 @@ between 5 and 3600 seconds, so a crashed provider cannot leave stale context beh
 }
 ```
 
-Term columns always follow `zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl`. Empty translations
-remain empty columns. The Rust types validate schema IDs, column count, limits, and duplicates.
+The first 16 term columns follow `zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl`.
+Additional languages follow in the order published by `CORPUS_LANGUAGE_ORDER`. Empty values keep
+their positions. Senders may omit trailing empty columns after the first 16.
+
+Starting the server with `--wordbooks PATH` exposes an XRTranslate bookmark archive under
+`xrtranslate.wordbooks`. Each child domain uses the permanent folder ID and starts disabled.
+The domain update endpoint persists recognition switches. The archive supplies the names and terms.
 
 ## Operational guarantees
 

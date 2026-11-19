@@ -24,11 +24,14 @@ impl RecognitionAlias {
         }
         for value in std::iter::once(&self.canonical).chain(&self.variants) {
             if value.trim().is_empty()
-                || value.contains([',', '\r', '\n'])
+                || value.contains(['\r', '\n'])
                 || value.chars().count() > 512
             {
-                return Err("recognition aliases must be single phrases of at most 512 characters, without commas".into());
+                return Err("recognition aliases must be single phrases of at most 512 characters".into());
             }
+        }
+        if self.variants.iter().any(|value| value.contains(',')) {
+            return Err("recognition aliases cannot contain commas".into());
         }
         Ok(())
     }

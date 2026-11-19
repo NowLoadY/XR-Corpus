@@ -7,7 +7,7 @@ and exposes HTTP and Rust client APIs.
 ## Design
 
 - Domains form a tree, so games and their term categories can be managed independently. Each
-  vocabulary node has a required domain and sixteen ordered language values. Domain topic words
+  vocabulary node belongs to a domain and stores its expressions in a fixed language order. Domain topic words
   are configured once and inherited by member terms and child domains. Individual overrides
   remain available for exceptions. Directed
   trigger and context edges connect nodes; an edge with a missing or disabled endpoint stays
@@ -46,8 +46,8 @@ provider is included at [`crates/client/examples/publish_runtime.rs`](crates/cli
 ## Vocabulary graph
 
 The [graph API](API.md#vocabulary-graph) manages domains, nodes and directed edges. A node
-contains one concept, with values in the fixed language order
-`zh,en,fr,pt,es,ja,ru,ko,th,it,de,vi,id,pl,cs,nl`. Missing translations are empty strings.
+contains one concept, with values in the order published by `CORPUS_LANGUAGE_ORDER`.
+The original 16 columns keep their positions. Additional languages occupy optional trailing columns.
 Disabling a domain or any ancestor, a node, or an edge immediately removes its effect from
 subsequent selections; the stored content remains available for later editing.
 
